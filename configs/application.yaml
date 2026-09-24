@@ -1,0 +1,16 @@
+server:
+  port: 8080                # Web 管理界面 + API 端口
+  mode: "release"           # gin 模式: debug / release
+
+storage:
+  root: "./data/storage"    # 文件存储根目录
+  database: "./data/nas-agent.db"  # SQLite 数据库文件
+  downloadDir: ""           # 下载转存任务的本地暂存目录，留空使用系统临时目录
+
+log:
+  level: "info"             # debug / info / warn / error
+
+# 初始管理员账号（仅首次启动数据库为空时创建）
+admin:
+  username: "admin"
+  password: "admin123"

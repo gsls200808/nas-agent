@@ -47,8 +47,12 @@
       <el-table-column label="创建时间" width="160">
         <template #default="{ row }">{{ fmtTime(row.createdAt) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="110" fixed="right">
+      <el-table-column label="操作" width="200" fixed="right">
         <template #default="{ row }">
+          <el-button v-if="row.status === 'pending' || row.status === 'running'"
+                     type="warning" link size="small" @click="doPause(row)">暂停</el-button>
+          <el-button v-if="row.status === 'paused'"
+                     type="success" link size="small" @click="doStart(row)">开始</el-button>
           <el-dropdown v-if="row.status === 'failed'" trigger="click" @command="(cmd) => doRetry(row, cmd)">
             <el-button type="primary" link size="small">
               重试<el-icon><ArrowDown /></el-icon>
@@ -62,7 +66,9 @@
               </el-dropdown-menu>
             </template>
           </el-dropdown>
-          <span v-else style="color:#c0c4cc">-</span>
+          <el-button v-if="row.status === 'success'"
+                     type="primary" link size="small" @click="doRedownload(row)">重新下载</el-button>
+          <el-button type="danger" link size="small" @click="doDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -130,17 +136,17 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
-import { listServers, createTransfer, listTransferTasks, listFiles, retryTransferTask, listRecentDirs } from '../api'
+import { listServers, createTransfer, listTransferTasks, listFiles, retryTransferTask, listRecentDirs, pauseTransferTask, startTransferTask, deleteTransferTask } from '../api'
 
 const servers = ref([])
 const tasks = ref([])
 const loading = ref(false)
 
-// 进行中：排队中/执行中；已完成：成功或失败（均不再执行，失败的可重试）
+// 进行中：排队中/执行中/已暂停；已完成：成功或失败（均不再执行，失败的可重试）
 const activeTab = ref('active')
-const isActive = (t) => t.status === 'pending' || t.status === 'running'
+const isActive = (t) => t.status === 'pending' || t.status === 'running' || t.status === 'paused'
 const counts = computed(() => ({
   active: tasks.value.filter(isActive).length,
   done: tasks.value.filter((t) => !isActive(t)).length,
@@ -314,12 +320,75 @@ async function doRetry(row, mode) {
   } catch (e) { /* 失败提示由 request 拦截器统一处理 */ }
 }
 
+// 暂停：中止运行中的传输，保留进度与本地暂存文件，之后可“开始”继续
+async function doPause(row) {
+  try {
+    await pauseTransferTask(row.id)
+    ElMessage.success(row.status === 'pending' ? '已暂停（原排队任务）' : '已暂停')
+    refresh()
+  } catch (e) { /* 失败提示由 request 拦截器统一处理 */ }
+}
+
+// 开始：继续已暂停的任务（从暂停时所处步骤续跑，已下载数据尽量复用）
+async function doStart(row) {
+  try {
+    await startTransferTask(row.id)
+    ElMessage.success('已开始继续任务')
+    startPolling()
+  } catch (e) { /* 失败提示由 request 拦截器统一处理 */ }
+}
+
+// 删除：运行中的会先中止；本地暂存文件与任务记录一并清理
+async function doDelete(row) {
+  const name = row.fileName || baseName(row.sourceUrl)
+  const active = row.status === 'pending' || row.status === 'running'
+  try {
+    await ElMessageBox.confirm(
+      active
+        ? `任务「${name}」仍在执行，删除将中止传输并清理本地暂存文件，确定删除？`
+        : `确定删除任务「${name}」？本地暂存文件将一并清理。`,
+      '删除转存任务',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch (e) {
+    return // 取消删除
+  }
+  try {
+    await deleteTransferTask(row.id)
+    ElMessage.success('任务已删除')
+    refresh()
+  } catch (e) { /* 失败提示由 request 拦截器统一处理 */ }
+}
+
+// 重新下载：已完成任务从头再执行一次（会重新下载并覆盖目标文件）
+async function doRedownload(row) {
+  const name = row.fileName || baseName(row.sourceUrl)
+  try {
+    await ElMessageBox.confirm(
+      `将重新下载「${name}」并覆盖目标服务器上的同名文件，确定继续？`,
+      '重新下载',
+      { type: 'warning', confirmButtonText: '重新下载', cancelButtonText: '取消' }
+    )
+  } catch (e) {
+    return // 取消
+  }
+  try {
+    await retryTransferTask(row.id, 'restart')
+    ElMessage.success('已开始重新下载')
+    startPolling()
+  } catch (e) { /* 失败提示由 request 拦截器统一处理 */ }
+}
+
 function stepText(step) {
   return { download: '下载', merge: '合并', upload: '转存' }[step] || step
 }
 
 function phaseText(row) {
   if (row.status === 'pending') return '排队中'
+  if (row.status === 'paused') {
+    const step = stepText(row.failedStep)
+    return step ? `已暂停（${step}），可点击“开始”继续` : '已暂停，可点击“开始”继续'
+  }
   if (row.status === 'success') return '已完成，本地暂存文件已清理'
   if (row.status === 'failed') {
     return (row.failedStep ? `失败于${stepText(row.failedStep)}步骤：` : '失败：') + (row.error || '')
@@ -341,11 +410,11 @@ function phaseText(row) {
 }
 
 function statusText(s) {
-  return { pending: '排队中', running: '进行中', success: '成功', failed: '失败' }[s] || s
+  return { pending: '排队中', running: '进行中', paused: '已暂停', success: '成功', failed: '失败' }[s] || s
 }
 
 function statusTag(s) {
-  return { pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[s] || 'info'
+  return { pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info'
 }
 
 function fmtSize(n) {

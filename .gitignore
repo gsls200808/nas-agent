@@ -13,3 +13,5 @@
 .vscode/
 .DS_Store
 *.log
+
+.fastRequest/

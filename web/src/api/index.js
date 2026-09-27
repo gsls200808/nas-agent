@@ -27,6 +27,12 @@ export const listTransferTasks = () => request.get('/transfer-tasks')
 export const getTransferTask = (taskId) => request.get(`/transfer-tasks/${taskId}`)
 // mode: 'restart' 从头开始 / 'resume' 从失败步骤开始
 export const retryTransferTask = (taskId, mode) => request.post(`/transfer-tasks/${taskId}/retry`, { mode })
+// 暂停排队中/进行中的任务（中止传输，保留进度与本地暂存文件）
+export const pauseTransferTask = (taskId) => request.post(`/transfer-tasks/${taskId}/pause`)
+// 开始（继续）已暂停的任务
+export const startTransferTask = (taskId) => request.post(`/transfer-tasks/${taskId}/start`)
+// 删除任务（运行中的先中止，本地暂存文件一并清理）
+export const deleteTransferTask = (taskId) => request.delete(`/transfer-tasks/${taskId}`)
 // 当前登录用户在某目标服务器下近期使用的存储目录（最多 10 个）
 export const listRecentDirs = (serverId) => request.get('/transfer-recent-dirs', { params: { serverId } })
 

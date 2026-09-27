@@ -49,6 +49,9 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 			authed.GET("/transfer-tasks", transferCtrl.List)
 			authed.GET("/transfer-tasks/:taskId", transferCtrl.Get)
 			authed.POST("/transfer-tasks/:taskId/retry", transferCtrl.Retry)
+			authed.POST("/transfer-tasks/:taskId/pause", transferCtrl.Pause)
+			authed.POST("/transfer-tasks/:taskId/start", transferCtrl.Start)
+			authed.DELETE("/transfer-tasks/:taskId", transferCtrl.Delete)
 
 			// 当前用户在某目标服务器下近期使用的存储目录
 			authed.GET("/transfer-recent-dirs", transferCtrl.RecentDirs)

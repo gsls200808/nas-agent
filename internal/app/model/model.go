@@ -66,7 +66,7 @@ type TransferTask struct {
 	Uploaded         int64      `json:"uploaded"`                 // 已转存字节数
 	Segments         int        `json:"segments"`                 // m3u8 总分片数
 	DownloadedSegs   int        `json:"downloadedSegs"`           // m3u8 已下载分片数
-	Status           string     `json:"status"`                   // pending / running / success / failed
+	Status           string     `json:"status"`                   // pending / running / paused / success / failed
 	Phase            string     `json:"phase"`                    // pending / downloading / merging / transferring / done
 	Progress         int        `json:"progress"`                 // 0-100
 	FailedStep       string     `json:"failedStep,omitempty"`     // 失败时所处步骤：download / merge / upload

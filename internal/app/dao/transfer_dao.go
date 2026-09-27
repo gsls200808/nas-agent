@@ -73,7 +73,8 @@ func ListTransferTasks(limit int) ([]*model.TransferTask, error) {
 	return list, rows.Err()
 }
 
-// InterruptUnfinishedTasks 把上次进程退出时仍在进行中的任务标记为失败（重启后无法继续执行）
+// InterruptUnfinishedTasks 把上次进程退出时仍在进行中的任务标记为失败（重启后无法继续执行）。
+// 已暂停的任务不受影响，重启后仍可“开始”继续
 func InterruptUnfinishedTasks(msg string) error {
 	if DB == nil {
 		return nil
@@ -81,6 +82,15 @@ func InterruptUnfinishedTasks(msg string) error {
 	_, err := DB.Exec(`UPDATE transfer_task
 		SET status='failed', error=?, finished_at=?
 		WHERE status IN ('pending','running')`, msg, time.Now())
+	return err
+}
+
+// DeleteTransferTask 按 ID 删除转存任务
+func DeleteTransferTask(id string) error {
+	if DB == nil {
+		return nil
+	}
+	_, err := DB.Exec(`DELETE FROM transfer_task WHERE id = ?`, id)
 	return err
 }
 

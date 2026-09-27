@@ -1,8 +1,10 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -28,6 +30,7 @@ import (
 const (
 	TaskPending = "pending"
 	TaskRunning = "running"
+	TaskPaused  = "paused"
 	TaskSuccess = "success"
 	TaskFailed  = "failed"
 )
@@ -53,6 +56,9 @@ const (
 	RetryRestart = "restart" // 从头开始：清理本地暂存文件重新下载
 	RetryResume  = "resume"  // 从失败步骤开始：复用已下载的本地文件
 )
+
+// errTaskPaused 任务被暂停/删除：运行中的传输被取消时以此错误中止
+var errTaskPaused = errors.New("任务已暂停")
 
 const (
 	// maxConcurrentTransfer 同时执行的转存任务数
@@ -88,6 +94,10 @@ type TransferService struct {
 	tasks map[string]*model.TransferTask
 	ids   []string        // 任务 ID，新的在前
 	dirty map[string]bool // 待落库的任务 ID
+
+	// 运行中任务的取消与结束信号（暂停/删除时中止传输并等待收尾）
+	cancels map[string]context.CancelFunc
+	dones   map[string]chan struct{}
 }
 
 // NewTransferService 创建转存服务，defaultDir 为空时使用系统临时目录
@@ -101,6 +111,8 @@ func NewTransferService(defaultDir string) *TransferService {
 		tasks:      make(map[string]*model.TransferTask),
 		ids:        make([]string, 0, maxTaskHistory),
 		dirty:      make(map[string]bool),
+		cancels:    make(map[string]context.CancelFunc),
+		dones:      make(map[string]chan struct{}),
 	}
 	s.interruptUnfinished()
 	go s.flushLoop()
@@ -318,15 +330,19 @@ func (s *TransferService) Retry(id, mode string) (*model.TransferTask, error) {
 	if !ok {
 		return nil, fmt.Errorf("任务不存在")
 	}
-	if cur.Status != TaskFailed {
-		return nil, fmt.Errorf("只有失败的任务可以重试")
+	if cur.Status != TaskFailed && cur.Status != TaskSuccess {
+		return nil, fmt.Errorf("只有失败或已完成的任务可以重试")
 	}
 
 	var step string
 	switch mode {
 	case RetryRestart:
+		// 成功任务的本地暂存文件已清理，cleanLocal 是幂等的
 		s.cleanLocal(cur)
 	case RetryResume:
+		if cur.Status == TaskSuccess {
+			return nil, fmt.Errorf("已完成任务请使用重新下载")
+		}
 		step = cur.FailedStep
 		if step == "" {
 			return nil, fmt.Errorf("该任务未记录失败步骤，无法从失败步骤继续")
@@ -369,7 +385,114 @@ func (s *TransferService) Retry(id, mode string) (*model.TransferTask, error) {
 	return got, nil
 }
 
-// ensure 把任务放回内存表（用于重试进程重启前遗留、只存在于数据库中的任务）
+// Pause 暂停任务：取消运行中的传输并等待收尾，返回暂停后的任务快照。
+// 排队中（等并发闸门）的任务直接变为已暂停。
+func (s *TransferService) Pause(id string) (*model.TransferTask, error) {
+	cur, ok := s.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("任务不存在")
+	}
+	if cur.Status != TaskPending && cur.Status != TaskRunning {
+		return nil, fmt.Errorf("只有排队中或进行中的任务可以暂停")
+	}
+	s.mu.RLock()
+	cancel, running := s.cancels[id]
+	done := s.dones[id]
+	s.mu.RUnlock()
+	if running {
+		cancel()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second): // 极端情况传输未及时中止，不阻塞接口
+			}
+		}
+	} else {
+		// worker 尚未注册（刚创建即暂停的窗口期），直接标记
+		s.markPaused(id)
+	}
+	got, _ := s.Get(id)
+	return got, nil
+}
+
+// Start 开始已暂停的任务：从暂停时所处步骤继续，已下载的数据尽量复用
+func (s *TransferService) Start(id string) (*model.TransferTask, error) {
+	cur, ok := s.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("任务不存在")
+	}
+	if cur.Status != TaskPaused {
+		return nil, fmt.Errorf("只有已暂停的任务可以开始")
+	}
+
+	// 进程重启前遗留的暂停任务只存在于数据库中，继续前先放回内存表
+	s.ensure(cur)
+
+	step := cur.FailedStep // 暂停时记录的续跑步骤
+	s.mutate(id, func(t *model.TransferTask) {
+		t.Status = TaskPending
+		t.Phase = PhasePending
+		t.ResumeStep = step
+		t.Error = ""
+		t.FailedStep = ""
+		t.FinishedAt = nil
+		t.Uploaded = 0
+		if step == StepUpload {
+			// 从上传继续：本地文件已就绪，进度回到上传起点
+			t.Progress = uploadBaseProgress(t.SourceType)
+		}
+	})
+	s.flush(id)
+
+	go s.run(id)
+
+	got, _ := s.Get(id)
+	return got, nil
+}
+
+// Delete 删除任务：运行中的先中止并等待收尾（释放文件句柄），
+// 再清理本地暂存文件与内存/数据库中的任务记录
+func (s *TransferService) Delete(id string) error {
+	cur, ok := s.Get(id)
+	if !ok {
+		return fmt.Errorf("任务不存在")
+	}
+
+	s.mu.RLock()
+	cancel, running := s.cancels[id]
+	done := s.dones[id]
+	s.mu.RUnlock()
+	if running {
+		cancel()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+			}
+		}
+	}
+
+	// 移出内存表与待落库集合（此后 worker 的任何写回都是空操作）
+	s.mu.Lock()
+	delete(s.tasks, id)
+	delete(s.dirty, id)
+	for i, v := range s.ids {
+		if v == id {
+			s.ids = append(s.ids[:i], s.ids[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if err := dao.DeleteTransferTask(id); err != nil {
+		return fmt.Errorf("删除任务记录失败: %v", err)
+	}
+	s.cleanLocal(cur)
+	util.Logger.Infof("转存任务 %s 已删除（含本地暂存文件）", id)
+	return nil
+}
+
+// ensure 把任务放回内存表（用于重试/继续进程重启前遗留、只存在于数据库中的任务）
 func (s *TransferService) ensure(t *model.TransferTask) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -392,17 +515,56 @@ func (s *TransferService) cleanLocal(t *model.TransferTask) {
 	}
 }
 
-// run 执行任务：拿并发闸门 → 下载 → 转存 → 更新状态
+// run 执行任务：拿并发闸门 → 下载 → 转存 → 更新状态。
+// 任务带独立的取消信号：暂停/删除时中止传输；排队中（等闸门）的任务被暂停则直接退出。
 func (s *TransferService) run(id string) {
-	s.sem <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.cancels[id] = cancel
+	s.dones[id] = done
+	st := ""
+	if t, ok := s.tasks[id]; ok {
+		st = t.Status
+	}
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		delete(s.cancels, id)
+		delete(s.dones, id)
+		s.mu.Unlock()
+		close(done)
+	}()
+	if st != TaskPending && st != TaskRunning {
+		return // 注册取消信号前任务已被暂停或删除
+	}
+
+	// 拿并发闸门（等待期间可被暂停打断）
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		s.markPaused(id)
+		return
+	}
 	defer func() { <-s.sem }()
+
+	if ctx.Err() != nil { // 拿到闸门时已被暂停
+		s.markPaused(id)
+		return
+	}
 
 	s.mutate(id, func(t *model.TransferTask) {
 		t.Status = TaskRunning
 		t.Phase = phaseOfStep(t.ResumeStep)
 	})
 
-	if err := s.transfer(id); err != nil {
+	if err := s.transfer(ctx, id); err != nil {
+		if ctx.Err() != nil || errors.Is(err, errTaskPaused) {
+			// 用户暂停：保留进度与本地暂存文件，记录暂停时所处步骤供“开始”续跑
+			s.markPaused(id)
+			return
+		}
 		s.mutate(id, func(t *model.TransferTask) {
 			t.Status = TaskFailed
 			t.Error = err.Error()
@@ -434,6 +596,26 @@ func (s *TransferService) run(id string) {
 	})
 	s.flush(id)
 	util.Logger.Infof("转存任务 %s 完成", id)
+}
+
+// markPaused 把任务标记为已暂停：记录暂停时所处步骤，保留本地暂存文件。
+// 只接管排队中/进行中的任务，避免把恰在此刻完成/失败的任务覆盖为暂停
+func (s *TransferService) markPaused(id string) {
+	marked := false
+	s.mutate(id, func(t *model.TransferTask) {
+		if t.Status != TaskPending && t.Status != TaskRunning {
+			return
+		}
+		t.Status = TaskPaused
+		t.Error = ""
+		t.FailedStep = stepOfPhase(t.Phase) // 暂停时所处步骤，供“开始”时续跑
+		t.FinishedAt = nil
+		marked = true
+	})
+	if marked {
+		s.flush(id)
+		util.Logger.Infof("转存任务 %s 已暂停", id)
+	}
 }
 
 // stepOfPhase 由当前阶段推断所处步骤
@@ -480,8 +662,8 @@ func checkLocalReady(localPath string) (int64, error) {
 	return fi.Size(), nil
 }
 
-// transfer 单个任务的完整流程；按 ResumeStep 决定从哪一步继续
-func (s *TransferService) transfer(id string) error {
+// transfer 单个任务的完整流程；按 ResumeStep 决定从哪一步继续；ctx 取消（暂停/删除）时中止传输
+func (s *TransferService) transfer(ctx context.Context, id string) error {
 	cur, ok := s.Get(id)
 	if !ok {
 		return fmt.Errorf("任务不存在")
@@ -503,7 +685,7 @@ func (s *TransferService) transfer(id string) error {
 				return err
 			}
 			localPath = cur.LocalPath
-		} else if localPath, size, err = s.downloadM3U8(cur, id); err != nil {
+		} else if localPath, size, err = s.downloadM3U8(ctx, cur, id); err != nil {
 			// m3u8：下载全部分片 → 合并为 MP4（重试时已下载完成的分片会被跳过）
 			return err
 		}
@@ -526,7 +708,7 @@ func (s *TransferService) transfer(id string) error {
 		}
 		var src io.ReadCloser
 		var resumed bool
-		src, size, fileName, resumed, err = openSource(cur.SourceURL, offset)
+		src, size, fileName, resumed, err = openSource(ctx, cur.SourceURL, offset)
 		if err != nil {
 			return fmt.Errorf("打开下载地址失败: %v", err)
 		}
@@ -550,7 +732,7 @@ func (s *TransferService) transfer(id string) error {
 			t.TargetPath = path.Join(cur.TargetDir, fileName)
 			t.Downloaded = offset // 续传时已有字节数计入进度
 		})
-		if err := s.downloadToLocal(src, localPath, size, id, offset); err != nil {
+		if err := s.downloadToLocal(ctx, src, localPath, size, id, offset); err != nil {
 			return err
 		}
 		_ = src.Close()
@@ -579,7 +761,7 @@ func (s *TransferService) transfer(id string) error {
 	if err := ensureRemoteDir(dstCli, cur.TargetDir); err != nil {
 		return err
 	}
-	if err := s.uploadLocal(dstCli, localPath, targetPath, size, id); err != nil {
+	if err := s.uploadLocal(ctx, dstCli, localPath, targetPath, size, id); err != nil {
 		return err
 	}
 	_ = dstCli.Close()
@@ -591,8 +773,9 @@ func (s *TransferService) transfer(id string) error {
 	return nil
 }
 
-// downloadToLocal 将下载流写入本地暂存文件；resumeFrom > 0 时追加写入（断点续传）
-func (s *TransferService) downloadToLocal(src io.Reader, localPath string, size int64, id string, resumeFrom int64) error {
+// downloadToLocal 将下载流写入本地暂存文件；resumeFrom > 0 时追加写入（断点续传）；
+// ctx 取消（暂停/删除）时立即中止
+func (s *TransferService) downloadToLocal(ctx context.Context, src io.Reader, localPath string, size int64, id string, resumeFrom int64) error {
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if resumeFrom > 0 {
 		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
@@ -601,7 +784,7 @@ func (s *TransferService) downloadToLocal(src io.Reader, localPath string, size 
 	if err != nil {
 		return fmt.Errorf("创建本地暂存文件失败: %v", err)
 	}
-	_, copyErr := io.Copy(f, &progressReader{r: src, onRead: func(n int64) { s.addBytes(id, true, n, size) }})
+	_, copyErr := io.Copy(f, &ctxReader{ctx: ctx, r: &progressReader{r: src, onRead: func(n int64) { s.addBytes(id, true, n, size) }}})
 	if err := f.Sync(); err != nil && copyErr == nil {
 		copyErr = err
 	}
@@ -614,15 +797,15 @@ func (s *TransferService) downloadToLocal(src io.Reader, localPath string, size 
 	return nil
 }
 
-// uploadLocal 将本地暂存文件上传到目标路径
-func (s *TransferService) uploadLocal(cli spec.Client, localPath, targetPath string, size int64, id string) error {
+// uploadLocal 将本地暂存文件上传到目标路径；ctx 取消（暂停/删除）时立即中止
+func (s *TransferService) uploadLocal(ctx context.Context, cli spec.Client, localPath, targetPath string, size int64, id string) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("打开本地暂存文件失败: %v", err)
 	}
 	defer f.Close()
 
-	if err := cli.Upload(targetPath, &progressReader{r: f, onRead: func(n int64) { s.addBytes(id, false, n, size) }}, size); err != nil {
+	if err := cli.Upload(targetPath, &ctxReader{ctx: ctx, r: &progressReader{r: f, onRead: func(n int64) { s.addBytes(id, false, n, size) }}}, size); err != nil {
 		return fmt.Errorf("转存到目标服务器失败: %v", err)
 	}
 	return nil
@@ -702,6 +885,27 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// ctxReader 读取时先检查任务是否被取消（暂停/删除），取消时立即中止传输
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(b []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, errTaskPaused
+	}
+	return c.r.Read(b)
+}
+
+// Close 关闭底层流（如果实现了 io.Closer），使 ctxReader 可作为 io.ReadCloser 使用
+func (c *ctxReader) Close() error {
+	if rc, ok := c.r.(io.Closer); ok {
+		return rc.Close()
+	}
+	return nil
+}
+
 // ---------- 下载地址（http/https/ftp） ----------
 
 // parseSourceURL 校验并解析下载地址
@@ -727,22 +931,23 @@ func parseSourceURL(raw string) (*url.URL, error) {
 }
 
 // openSource 打开下载地址，返回数据流、文件大小（未知为 -1）、文件名、是否成功续传。
-// offset > 0 时表示断点续传（仅 http/https 支持，FTP 不支持则从头下载）
-func openSource(raw string, offset int64) (io.ReadCloser, int64, string, bool, error) {
+// offset > 0 时表示断点续传（仅 http/https 支持，FTP 不支持则从头下载）；
+// ctx 取消（暂停/删除）时中止下载
+func openSource(ctx context.Context, raw string, offset int64) (io.ReadCloser, int64, string, bool, error) {
 	u, err := parseSourceURL(raw)
 	if err != nil {
 		return nil, 0, "", false, err
 	}
 	if strings.ToLower(u.Scheme) == "ftp" {
-		rc, size, name, err := openFTPSource(u)
+		rc, size, name, err := openFTPSource(ctx, u)
 		return rc, size, name, false, err
 	}
-	return openHTTPSource(u, offset)
+	return openHTTPSource(ctx, u, offset)
 }
 
 // openHTTPSource 通过 HTTP(S) GET 打开下载流，offset > 0 时使用 Range 请求续传
-func openHTTPSource(u *url.URL, offset int64) (io.ReadCloser, int64, string, bool, error) {
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+func openHTTPSource(ctx context.Context, u *url.URL, offset int64) (io.ReadCloser, int64, string, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, 0, "", false, err
 	}
@@ -783,8 +988,8 @@ func openHTTPSource(u *url.URL, offset int64) (io.ReadCloser, int64, string, boo
 	return resp.Body, size, fileName, resumed, nil
 }
 
-// openFTPSource 通过 FTP 客户端打开下载流
-func openFTPSource(u *url.URL) (io.ReadCloser, int64, string, error) {
+// openFTPSource 通过 FTP 客户端打开下载流；ctx 取消（暂停/删除）时中止读取
+func openFTPSource(ctx context.Context, u *url.URL) (io.ReadCloser, int64, string, error) {
 	port := consts.DefaultFTPPort
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
@@ -822,7 +1027,7 @@ func openFTPSource(u *url.URL) (io.ReadCloser, int64, string, error) {
 	if fileName == "" {
 		fileName = fileNameFromURL(u)
 	}
-	return &streamCloser{rc: rc, cli: cli}, fi.Size, fileName, nil
+	return &streamCloser{rc: &ctxReader{ctx: ctx, r: rc}, cli: cli}, fi.Size, fileName, nil
 }
 
 // fileNameFromURL 从地址路径取文件名

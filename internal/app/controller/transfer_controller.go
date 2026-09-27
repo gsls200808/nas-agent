@@ -100,3 +100,35 @@ func (t *TransferController) Retry(c *gin.Context) {
 	}
 	rsp.OK(c, task)
 }
+
+// Pause POST /api/transfer-tasks/:taskId/pause
+// 暂停排队中/进行中的任务：中止传输，保留进度与本地暂存文件
+func (t *TransferController) Pause(c *gin.Context) {
+	task, err := t.svc.Pause(c.Param("taskId"))
+	if err != nil {
+		rsp.Fail(c, err.Error())
+		return
+	}
+	rsp.OK(c, task)
+}
+
+// Start POST /api/transfer-tasks/:taskId/start
+// 开始（继续）已暂停的任务：从暂停时所处步骤续跑
+func (t *TransferController) Start(c *gin.Context) {
+	task, err := t.svc.Start(c.Param("taskId"))
+	if err != nil {
+		rsp.Fail(c, err.Error())
+		return
+	}
+	rsp.OK(c, task)
+}
+
+// Delete DELETE /api/transfer-tasks/:taskId
+// 删除任务：运行中的先中止；本地暂存文件与任务记录一并清理
+func (t *TransferController) Delete(c *gin.Context) {
+	if err := t.svc.Delete(c.Param("taskId")); err != nil {
+		rsp.Fail(c, err.Error())
+		return
+	}
+	rsp.OK(c, nil)
+}

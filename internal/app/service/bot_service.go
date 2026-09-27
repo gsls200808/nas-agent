@@ -425,7 +425,7 @@ func (s *BotService) tryOnlineSearch(ctx context.Context, userID int64, creds cl
 	}
 	util.Logger.Infof("机器人 %d 本地无「%s」，尝试在线搜索", userID, keyword)
 
-	items, err := s.searchSvc.Search(keyword, 1, 5)
+	items, err := s.searchSvc.Search(keyword, 1, 10)
 	if err != nil {
 		util.Logger.Errorf("机器人 %d 在线搜索失败: %v", userID, err)
 		_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("在线搜索失败: %v", err))

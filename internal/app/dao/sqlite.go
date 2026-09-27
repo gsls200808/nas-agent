@@ -88,6 +88,48 @@ func migrate() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_transfer_recent_dir ON transfer_recent_dir(user_id, server_id, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS music_config (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			server_id INTEGER NOT NULL DEFAULT 0,
+			music_dir TEXT NOT NULL DEFAULT '/',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_music_config_user ON music_config(user_id)`,
+		`CREATE TABLE IF NOT EXISTS music_play_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			chat_id TEXT NOT NULL DEFAULT '',
+			song_name TEXT NOT NULL DEFAULT '',
+			song_path TEXT NOT NULL DEFAULT '',
+			server_id INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'success',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_music_play_log_user ON music_play_log(user_id, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS bot_config (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			bot_token TEXT NOT NULL DEFAULT '',
+			base_url TEXT NOT NULL DEFAULT '',
+			bot_id TEXT NOT NULL DEFAULT '',
+			ilink_user_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'offline',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_config_user ON bot_config(user_id)`,
+		`CREATE TABLE IF NOT EXISTS quark_config (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			cookie TEXT NOT NULL DEFAULT '',
+			nickname TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'unbound',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_quark_config_user ON quark_config(user_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := DB.Exec(s); err != nil {

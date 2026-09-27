@@ -7,6 +7,7 @@
         <el-menu-item index="/servers">服务器管理</el-menu-item>
         <el-menu-item index="/files">文件浏览</el-menu-item>
         <el-menu-item index="/transfers">转存任务</el-menu-item>
+        <el-menu-item index="/bot">微信机器人</el-menu-item>
         <el-menu-item index="/users">用户管理</el-menu-item>
       </el-menu>
     </el-aside>

@@ -17,6 +17,7 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 	fileCtrl := controller.NewFileController(service.NewFileService())
 	transferCtrl := controller.NewTransferController(service.NewTransferService(defaultDownloadDir))
 	userCtrl := controller.NewUserController(service.NewUserService())
+	botCtrl := controller.NewBotController()
 
 	api := r.Group("/api")
 	{
@@ -56,6 +57,22 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 			// 当前用户在某目标服务器下近期使用的存储目录
 			authed.GET("/transfer-recent-dirs", transferCtrl.RecentDirs)
 
+			// 微信机器人
+			authed.GET("/bot/status", botCtrl.Status)
+			authed.POST("/bot/login/qrcode", botCtrl.QRCode)
+			authed.POST("/bot/login/confirm", botCtrl.ConfirmLogin)
+			authed.POST("/bot/start", botCtrl.Start)
+			authed.POST("/bot/stop", botCtrl.Stop)
+			authed.GET("/bot/music/config", botCtrl.GetMusicConfig)
+			authed.POST("/bot/music/config", botCtrl.SaveMusicConfig)
+
+			// 夸克网盘（音乐在线搜索下载依赖）
+			authed.GET("/bot/quark/status", botCtrl.QuarkStatus)
+			authed.POST("/bot/quark/cookie", botCtrl.QuarkSaveCookie)
+			authed.POST("/bot/quark/logout", botCtrl.QuarkLogout)
+			authed.GET("/bot/quark/qrcode", botCtrl.QuarkQRCode)
+			authed.POST("/bot/quark/qrcode/poll", botCtrl.QuarkQRCodePoll)
+
 			// 用户管理（仅管理员）
 			admin := authed.Group("/users")
 			admin.Use(middleware.RequireAdmin())
@@ -66,4 +83,7 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 			}
 		}
 	}
+
+	// 服务启动后恢复所有已登录微信机器人的消息轮询
+	botCtrl.ResumeOnStartup()
 }

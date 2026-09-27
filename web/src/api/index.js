@@ -40,3 +40,19 @@ export const listRecentDirs = (serverId) => request.get('/transfer-recent-dirs',
 export const listUsers = () => request.get('/users')
 export const createUser = (data) => request.post('/users', data)
 export const deleteUser = (id) => request.delete(`/users/${id}`)
+
+// ---- 微信机器人 ----
+export const getBotStatus = () => request.get('/bot/status')
+export const getBotQRCode = () => request.post('/bot/login/qrcode')
+export const confirmBotLogin = (data) => request.post('/bot/login/confirm', data)
+export const startBot = () => request.post('/bot/start')
+export const stopBot = () => request.post('/bot/stop')
+export const getMusicConfig = () => request.get('/bot/music/config')
+export const saveMusicConfig = (data) => request.post('/bot/music/config', data)
+
+// ---- 夸克网盘（机器人音乐在线搜索依赖） ----
+export const getQuarkStatus = () => request.get('/bot/quark/status')
+export const saveQuarkCookie = (cookie) => request.post('/bot/quark/cookie', { cookie })
+export const quarkLogout = () => request.post('/bot/quark/logout')
+export const getQuarkQRCode = () => request.get('/bot/quark/qrcode')
+export const pollQuarkQRCode = (token) => request.post('/bot/quark/qrcode/poll', { token })

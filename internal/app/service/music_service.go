@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -65,7 +67,9 @@ func (s *MusicService) SaveConfig(userID, serverID int64, musicDir string) error
 
 // SongInfo 歌曲信息
 type SongInfo struct {
-	Name     string `json:"name"`
+	Name     string `json:"name"`   // 文件名（去扩展名）
+	Title    string `json:"title"`  // 解析出的歌名（去掉歌手部分）
+	Artist   string `json:"artist"` // 解析出的歌手（无法解析时为空）
 	Path     string `json:"path"`
 	ServerID int64  `json:"serverId"`
 	Size     int64  `json:"size"`
@@ -88,8 +92,49 @@ func (s *MusicService) PickRandomSong(userID int64) (*SongInfo, error) {
 	return songs[rand.Intn(len(songs))], nil
 }
 
-// SearchSong 按歌名搜索
-func (s *MusicService) SearchSong(userID int64, keyword string) (*SongInfo, error) {
+// LocalMatch 本地搜索分类结果
+type LocalMatch struct {
+	Exact []*SongInfo // 歌名完全匹配（不区分大小写），可能同名多首
+	Fuzzy []*SongInfo // 歌名/歌手包含关键词但非完全匹配
+}
+
+// songSepRe 歌名与歌手分隔符：「歌名 - 歌手」「歌名-歌手」等（半角/全角横线）
+var songSepRe = regexp.MustCompile(`\s*[-－–—]\s*`)
+
+// parseTitleArtist 从文件名解析歌名与歌手
+func parseTitleArtist(baseName string) (title, artist string) {
+	parts := songSepRe.Split(strings.TrimSpace(baseName), 2)
+	title = strings.TrimSpace(parts[0])
+	if len(parts) == 2 {
+		artist = strings.TrimSpace(parts[1])
+	}
+	return
+}
+
+// splitSongKeyword 拆分用户输入的「歌名 - 歌手」/「歌手 - 歌名」
+func splitSongKeyword(keyword string) []string {
+	parts := songSepRe.Split(strings.TrimSpace(keyword), 2)
+	out := make([]string, 0, 2)
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func ciEq(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+func ciContains(a, b string) bool {
+	return strings.Contains(strings.ToLower(a), strings.ToLower(b))
+}
+
+// SearchLocal 本地分类搜索：
+// 支持「歌名 - 歌手」「歌手 - 歌名」两种输入顺序；
+// 返回完全匹配（歌名一致）与模糊匹配（仅包含）两组，由调用方决定直接播放还是进入交互菜单。
+func (s *MusicService) SearchLocal(userID int64, keyword string) (*LocalMatch, error) {
 	cfg, err := s.GetConfig(userID)
 	if err != nil || cfg.ServerID == 0 {
 		return nil, fmt.Errorf("请先配置音乐目录")
@@ -98,28 +143,66 @@ func (s *MusicService) SearchSong(userID int64, keyword string) (*SongInfo, erro
 	if err != nil {
 		return nil, err
 	}
-	keyword = strings.ToLower(keyword)
-	var matches []*SongInfo
+	parts := splitSongKeyword(keyword)
+	if len(parts) == 0 {
+		return &LocalMatch{}, nil
+	}
+
+	m := &LocalMatch{}
+	seen := map[string]bool{}
 	for _, song := range songs {
-		if strings.Contains(strings.ToLower(song.Name), keyword) {
-			matches = append(matches, song)
+		var exact, fuzzy bool
+		if len(parts) == 2 {
+			p1, p2 := parts[0], parts[1]
+			t, a := song.Title, song.Artist
+			// 两种顺序都算精确匹配
+			exact = (ciEq(t, p1) && ciEq(a, p2)) || (ciEq(a, p1) && ciEq(t, p2))
+			// 模糊：两部分分别能在歌名或歌手中找到（允许互换）
+			if !exact {
+				matchP1 := ciContains(t, p1) || ciContains(a, p1) || ciContains(song.Name, p1)
+				matchP2 := ciContains(t, p2) || ciContains(a, p2) || ciContains(song.Name, p2)
+				fuzzy = matchP1 && matchP2
+			}
+		} else {
+			k := parts[0]
+			exact = ciEq(song.Title, k) || ciEq(song.Name, k)
+			if !exact {
+				fuzzy = ciContains(song.Title, k) || ciContains(song.Name, k) || ciContains(song.Artist, k)
+			}
+		}
+		if exact {
+			if !seen[song.Path] {
+				m.Exact = append(m.Exact, song)
+				seen[song.Path] = true
+			}
+		} else if fuzzy {
+			m.Fuzzy = append(m.Fuzzy, song)
 		}
 	}
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("没有找到包含「%s」的歌曲", keyword)
+
+	// 模糊结果排序：歌名前缀优先，其次歌名包含，最后歌手包含
+	k := strings.ToLower(parts[0])
+	sort.SliceStable(m.Fuzzy, func(i, j int) bool {
+		return fuzzyScore(m.Fuzzy[i], k) < fuzzyScore(m.Fuzzy[j], k)
+	})
+	if len(m.Fuzzy) > 20 {
+		m.Fuzzy = m.Fuzzy[:20]
 	}
-	// 优先返回最匹配的（名称完全相等 > 前缀匹配 > 包含）
-	for _, m := range matches {
-		if strings.EqualFold(m.Name, keyword) {
-			return m, nil
-		}
+	return m, nil
+}
+
+// fuzzyScore 模糊匹配排序分值（越小越靠前）
+func fuzzyScore(song *SongInfo, k string) int {
+	switch {
+	case strings.HasPrefix(strings.ToLower(song.Title), k):
+		return 0
+	case strings.Contains(strings.ToLower(song.Title), k):
+		return 1
+	case strings.Contains(strings.ToLower(song.Name), k):
+		return 2
+	default:
+		return 3
 	}
-	for _, m := range matches {
-		if strings.HasPrefix(strings.ToLower(m.Name), keyword) {
-			return m, nil
-		}
-	}
-	return matches[0], nil
 }
 
 // listSongs 递归列出目录下所有音频文件
@@ -144,8 +227,12 @@ func (s *MusicService) listSongs(serverID int64, dir string) ([]*SongInfo, error
 					return err
 				}
 			} else if audioExts[strings.ToLower(path.Ext(item.Name))] {
+				base := strings.TrimSuffix(item.Name, path.Ext(item.Name))
+				title, artist := parseTitleArtist(base)
 				songs = append(songs, &SongInfo{
-					Name:     strings.TrimSuffix(item.Name, path.Ext(item.Name)),
+					Name:     base,
+					Title:    title,
+					Artist:   artist,
 					Path:     fullPath,
 					ServerID: serverID,
 					Size:     item.Size,

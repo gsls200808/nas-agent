@@ -28,18 +28,22 @@ type BotService struct {
 	pending   map[string]*PendingSelection // 微信联系人 FromUserID → 待选歌曲列表
 }
 
-// PendingSong 待选歌曲（在线搜索结果）
+// PendingSong 待选歌曲
 type PendingSong struct {
 	Index    int
 	Title    string
 	Artist   string
 	Quality  string
-	SearchID string // 全盘搜歌曲 ID
+	SearchID string     // 全盘搜歌曲 ID 或歌曲宝详情页 ID（网络菜单）
+	Source   string     // 来源：xia（全盘搜）/ gequbao（歌曲宝）
+	Local    *SongInfo  // 本地歌曲（本地菜单）
 }
 
 // PendingSelection 待选歌曲列表（10 分钟过期）
 type PendingSelection struct {
 	Songs     []PendingSong
+	Type      string // local（本地交互菜单）/ web（网络搜索列表）
+	Keyword   string // 原始关键词（本地菜单回复 0 时用于网络搜索）
 	CreatedAt time.Time
 }
 
@@ -58,10 +62,15 @@ func NewBotService() *BotService {
 }
 
 // setPending 保存待选列表
-func (s *BotService) setPending(chatUserID string, songs []PendingSong) {
+func (s *BotService) setPending(chatUserID, selType, keyword string, songs []PendingSong) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	s.pending[chatUserID] = &PendingSelection{Songs: songs, CreatedAt: time.Now()}
+	s.pending[chatUserID] = &PendingSelection{
+		Songs:     songs,
+		Type:      selType,
+		Keyword:   keyword,
+		CreatedAt: time.Now(),
+	}
 }
 
 // getPending 获取待选列表（过期自动清理）
@@ -339,11 +348,17 @@ func (s *BotService) handleMessage(ctx context.Context, userID int64, creds claw
 		keyword := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "听音乐 "), "听歌 "))
 		s.handlePlayMusic(ctx, userID, creds, target, keyword)
 	default:
-		// 纯数字回复且有待选列表 → 选择歌曲下载
-		if n, err := strconv.Atoi(text); err == nil && s.getPending(target.ToUserID) != nil {
-			util.Logger.Infof("机器人 %d 收到序号选择 %d from=%s", userID, n, msg.FromUserID)
-			s.handlePickSong(ctx, userID, creds, target, n)
-			return
+		// 纯数字回复且有待选列表 → 按列表类型处理
+		if n, err := strconv.Atoi(text); err == nil {
+			if sel := s.getPending(target.ToUserID); sel != nil {
+				util.Logger.Infof("机器人 %d 收到序号选择 %d from=%s", userID, n, msg.FromUserID)
+				if sel.Type == "local" {
+					s.handleLocalPick(ctx, userID, creds, target, n)
+				} else {
+					s.handlePickSong(ctx, userID, creds, target, n)
+				}
+				return
+			}
 		}
 		// 不认识的指令，不回复
 	}
@@ -352,31 +367,122 @@ func (s *BotService) handleMessage(ctx context.Context, userID int64, creds claw
 // handlePlayMusic 处理听音乐指令
 func (s *BotService) handlePlayMusic(ctx context.Context, userID int64, creds clawbot.Credentials, target clawbot.ReplyTarget, keyword string) {
 	util.Logger.Infof("机器人 %d 开始处理听音乐指令 keyword=%q", userID, keyword)
-	var song *SongInfo
-	var err error
 
-	t0 := time.Now()
 	if keyword == "" {
-		song, err = s.musicSvc.PickRandomSong(userID)
-	} else {
-		song, err = s.musicSvc.SearchSong(userID, keyword)
-	}
-	if err != nil {
-		util.Logger.Errorf("机器人 %d 选歌失败（耗时 %s）: %v", userID, time.Since(t0), err)
-		// 本地音乐目录没找到 → 尝试在线搜索（夸克网盘转存下载）
-		if keyword != "" && s.tryOnlineSearch(ctx, userID, creds, target, keyword) {
+		// 无关键词：随机播放
+		t0 := time.Now()
+		song, err := s.musicSvc.PickRandomSong(userID)
+		if err != nil {
+			util.Logger.Errorf("机器人 %d 随机选歌失败（耗时 %s）: %v", userID, time.Since(t0), err)
+			_ = clawbot.SendText(ctx, creds, target, err.Error())
 			return
 		}
-		if e := clawbot.SendText(ctx, creds, target, err.Error()); e != nil {
-			util.Logger.Errorf("机器人 %d 回复选歌失败提示也失败: %v", userID, e)
-		}
+		s.sendLocalSong(ctx, userID, creds, target, song)
 		return
 	}
-	util.Logger.Infof("机器人 %d 选中歌曲（耗时 %s）: %s (%s, %d bytes)",
-		userID, time.Since(t0), song.Name, song.Path, song.Size)
+
+	// 有关键词：本地精确/模糊分类搜索
+	t0 := time.Now()
+	match, err := s.musicSvc.SearchLocal(userID, keyword)
+	if err != nil {
+		util.Logger.Errorf("机器人 %d 本地搜索失败（耗时 %s）: %v", userID, time.Since(t0), err)
+		// 音乐目录未配置等错误 → 尝试在线搜索
+		if s.tryOnlineSearch(ctx, userID, creds, target, keyword) {
+			return
+		}
+		_ = clawbot.SendText(ctx, creds, target, err.Error())
+		return
+	}
+
+	switch {
+	case len(match.Exact) == 1:
+		// 唯一精确匹配 → 直接播放
+		s.sendLocalSong(ctx, userID, creds, target, match.Exact[0])
+	case len(match.Exact) > 1:
+		// 同名多首 → 交互菜单
+		util.Logger.Infof("机器人 %d 「%s」本地精确匹配到 %d 首，进入交互菜单", userID, keyword, len(match.Exact))
+		s.replyLocalMenu(ctx, creds, target, keyword, match.Exact)
+	case len(match.Fuzzy) > 0:
+		// 只有模糊匹配 → 交互菜单（避免搜「月光」直接播「白月光与朱砂痣」）
+		util.Logger.Infof("机器人 %d 「%s」无精确匹配，模糊匹配到 %d 首，进入交互菜单", userID, keyword, len(match.Fuzzy))
+		s.replyLocalMenu(ctx, creds, target, keyword, match.Fuzzy)
+	default:
+		// 本地完全没有 → 网络搜索
+		if s.tryOnlineSearch(ctx, userID, creds, target, keyword) {
+			return
+		}
+		_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("没有找到包含「%s」的歌曲（网络搜索需先在网页端绑定夸克网盘）", keyword))
+	}
+}
+
+// songDisplayName 歌曲展示名：「歌名 - 歌手」
+func songDisplayName(song *SongInfo) string {
+	switch {
+	case song.Artist != "":
+		return song.Title + " - " + song.Artist
+	case song.Title != "":
+		return song.Title
+	default:
+		return song.Name
+	}
+}
+
+// replyLocalMenu 回复本地歌曲交互菜单：1.播放 … 0.进入网络搜索
+func (s *BotService) replyLocalMenu(ctx context.Context, creds clawbot.Credentials, target clawbot.ReplyTarget, keyword string, songs []*SongInfo) {
+	pending := make([]PendingSong, 0, len(songs))
+	var sb strings.Builder
+	sb.WriteString("本地找到以下相关歌曲，回复序号播放，回复 0 进行网络搜索：")
+	for i, sg := range songs {
+		n := i + 1
+		pending = append(pending, PendingSong{Index: n, Title: sg.Title, Artist: sg.Artist, Local: sg})
+		fmt.Fprintf(&sb, "\n%d. 播放 %s", n, songDisplayName(sg))
+	}
+	sb.WriteString("\n0. 进入网络搜索")
+	s.setPending(target.ToUserID, "local", keyword, pending)
+	if err := clawbot.SendText(ctx, creds, target, sb.String()); err != nil {
+		util.Logger.Errorf("发送本地菜单失败: %v", err)
+	}
+}
+
+// handleLocalPick 处理本地菜单的序号回复
+func (s *BotService) handleLocalPick(ctx context.Context, userID int64, creds clawbot.Credentials, target clawbot.ReplyTarget, n int) {
+	sel := s.getPending(target.ToUserID)
+	if sel == nil {
+		_ = clawbot.SendText(ctx, creds, target, "列表已过期，请重新发送「听音乐 歌名」搜索")
+		return
+	}
+	// 0 → 进入网络搜索（用菜单保存的原始关键词）
+	if n == 0 {
+		keyword := sel.Keyword
+		util.Logger.Infof("机器人 %d 用户选择网络搜索，关键词=%q", userID, keyword)
+		if s.tryOnlineSearch(ctx, userID, creds, target, keyword) {
+			return
+		}
+		_ = clawbot.SendText(ctx, creds, target, "网络搜索需先在网页端绑定夸克网盘")
+		return
+	}
+	if n < 1 || n > len(sel.Songs) {
+		_ = clawbot.SendText(ctx, creds, target, "序号无效，请回复列表中的序号（或回复 0 进行网络搜索）")
+		return
+	}
+	// 有效序号 → 取出并清除菜单
+	s.takePending(target.ToUserID)
+	song := sel.Songs[n-1].Local
+	if song == nil {
+		_ = clawbot.SendText(ctx, creds, target, "序号无效，请重新发送「听音乐 歌名」搜索")
+		return
+	}
+	util.Logger.Infof("机器人 %d 用户从本地菜单选择 %d: %s", userID, n, songDisplayName(song))
+	s.sendLocalSong(ctx, userID, creds, target, song)
+}
+
+// sendLocalSong 下载 NAS 上的本地歌曲并发送到微信
+func (s *BotService) sendLocalSong(ctx context.Context, userID int64, creds clawbot.Credentials, target clawbot.ReplyTarget, song *SongInfo) {
+	displayName := songDisplayName(song)
+	util.Logger.Infof("机器人 %d 选中歌曲: %s (%s, %d bytes)", userID, displayName, song.Path, song.Size)
 
 	// 先回复歌名
-	if err := clawbot.SendText(ctx, creds, target, fmt.Sprintf("🎵 正在为您播放: %s", song.Name)); err != nil {
+	if err := clawbot.SendText(ctx, creds, target, fmt.Sprintf("🎵 正在为您播放: %s", displayName)); err != nil {
 		util.Logger.Errorf("机器人 %d 发送播放提示文本失败: %v", userID, err)
 	}
 
@@ -403,17 +509,17 @@ func (s *BotService) handlePlayMusic(ctx context.Context, userID int64, creds cl
 	t2 := time.Now()
 	if err := clawbot.SendMediaByPath(ctx, creds, target, clawbot.MediaOpts{
 		FilePath: localPath,
-		Caption:  song.Name,
+		Caption:  displayName,
 	}); err != nil {
 		util.Logger.Errorf("机器人 %d 发送歌曲失败（耗时 %s）: %v", userID, time.Since(t2), err)
 		_ = clawbot.SendText(ctx, creds, target, "发送歌曲失败: "+err.Error())
-		_ = s.musicSvc.LogPlay(userID, target.ToUserID, song.Name, song.Path, song.ServerID, "send_failed")
+		_ = s.musicSvc.LogPlay(userID, target.ToUserID, displayName, song.Path, song.ServerID, "send_failed")
 		return
 	}
 
-	_ = s.musicSvc.LogPlay(userID, target.ToUserID, song.Name, song.Path, song.ServerID, "success")
+	_ = s.musicSvc.LogPlay(userID, target.ToUserID, displayName, song.Path, song.ServerID, "success")
 	util.Logger.Infof("机器人 %d 发送歌曲成功（耗时 %s）: %s -> %s",
-		userID, time.Since(t2), song.Name, target.ToUserID)
+		userID, time.Since(t2), displayName, target.ToUserID)
 }
 
 // tryOnlineSearch 本地没找到歌曲时，通过全盘搜在线查找并回复编号列表。
@@ -425,21 +531,15 @@ func (s *BotService) tryOnlineSearch(ctx context.Context, userID int64, creds cl
 	}
 	util.Logger.Infof("机器人 %d 本地无「%s」，尝试在线搜索", userID, keyword)
 
-	items, err := s.searchSvc.Search(keyword, 1, 10)
-	if err != nil {
-		util.Logger.Errorf("机器人 %d 在线搜索失败: %v", userID, err)
-		_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("在线搜索失败: %v", err))
-		return true
-	}
-	if len(items) == 0 {
-		_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("本地音乐目录和网上都没有找到「%s」", keyword))
-		return true
-	}
-
-	// 组装编号列表并保存待选状态
-	songs := make([]PendingSong, 0, len(items))
+	songs := make([]PendingSong, 0, 20)
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "本地没有找到「%s」，网上搜索到以下歌曲，回复序号下载：\n", keyword)
+
+	// 来源一：全盘搜（编号 1-10）
+	items, err := s.searchSvc.Search(keyword, 1, 10)
+	if err != nil {
+		util.Logger.Errorf("机器人 %d 全盘搜失败: %v", userID, err)
+	}
 	for i, it := range items {
 		n := i + 1
 		quality := ""
@@ -447,13 +547,40 @@ func (s *BotService) tryOnlineSearch(ctx context.Context, userID int64, creds cl
 			quality = it.Quality[0]
 		}
 		songs = append(songs, PendingSong{
-			Index: n, Title: it.Title, Artist: it.Artist, Quality: quality, SearchID: it.ID,
+			Index: n, Title: it.Title, Artist: it.Artist, Quality: quality, SearchID: it.ID, Source: "xia",
 		})
 		fmt.Fprintf(&sb, "%d %s - %s（%s）\n", n, it.Title, it.Artist, quality)
 	}
-	s.setPending(target.ToUserID, songs)
+
+	// 来源二：歌曲宝（编号固定从 11 开始，最多 10 条）
+	gqItems, gerr := s.searchSvc.GequbaoSearch(keyword, 10)
+	if gerr != nil {
+		util.Logger.Errorf("机器人 %d 歌曲宝搜索失败: %v", userID, gerr)
+	}
+	for i, g := range gqItems {
+		n := 11 + i
+		title, artist := splitSongTitle(g.Title)
+		songs = append(songs, PendingSong{
+			Index: n, Title: title, Artist: artist, Quality: "歌曲宝", SearchID: g.ID, Source: "gequbao",
+		})
+		fmt.Fprintf(&sb, "%d %s - %s（歌曲宝）\n", n, title, artist)
+	}
+
+	if len(songs) == 0 {
+		_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("本地音乐目录和网上都没有找到「%s」", keyword))
+		return true
+	}
+	s.setPending(target.ToUserID, "web", keyword, songs)
 	_ = clawbot.SendText(ctx, creds, target, strings.TrimSpace(sb.String()))
 	return true
+}
+
+// splitSongTitle 拆分「歌名 - 歌手」格式标题
+func splitSongTitle(s string) (title, artist string) {
+	if i := strings.Index(s, " - "); i > 0 {
+		return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+3:])
+	}
+	return s, ""
 }
 
 // handlePickSong 处理序号选择：解析网盘分享链接 → 转存下载 → 发送 → 上传音乐目录
@@ -473,12 +600,28 @@ func (s *BotService) handlePickSong(ctx context.Context, userID int64, creds cla
 	_ = clawbot.SendText(ctx, creds, target, fmt.Sprintf("🎵 正在从网盘获取「%s」，请稍候…", caption))
 
 	t0 := time.Now()
-	// 获取网盘分享链接
-	shareURL, _, err := s.searchSvc.GetShareURL(song.SearchID)
-	if err != nil {
-		util.Logger.Errorf("机器人 %d 获取分享链接失败: %v", userID, err)
-		_ = clawbot.SendText(ctx, creds, target, "获取分享链接失败: "+err.Error())
-		return
+	// 按来源获取网盘分享链接（均为夸克分享，统一走转存下载）
+	var shareURL string
+	switch song.Source {
+	case "gequbao":
+		link, pwd, err := s.searchSvc.GequbaoQuarkLink(song.SearchID)
+		if err != nil {
+			util.Logger.Errorf("机器人 %d 获取歌曲宝分享链接失败: %v", userID, err)
+			_ = clawbot.SendText(ctx, creds, target, "获取分享链接失败: "+err.Error())
+			return
+		}
+		if pwd != "" {
+			link += " 提取码：" + pwd
+		}
+		shareURL = link
+	default:
+		link, _, err := s.searchSvc.GetShareURL(song.SearchID)
+		if err != nil {
+			util.Logger.Errorf("机器人 %d 获取分享链接失败: %v", userID, err)
+			_ = clawbot.SendText(ctx, creds, target, "获取分享链接失败: "+err.Error())
+			return
+		}
+		shareURL = link
 	}
 	// 解析转存下载
 	localPath, fileName, err := s.quarkSvc.DownloadFromShare(userID, shareURL, song.Title)

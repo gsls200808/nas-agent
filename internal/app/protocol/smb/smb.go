@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"nas-agent/internal/app/common/util"
 	"nas-agent/internal/app/model"
 	"nas-agent/internal/app/protocol/spec"
 )
@@ -48,8 +49,8 @@ const (
 
 // 访问掩码/创建参数
 const (
-	genericRead      = 0x80000000
-	genericWrite     = 0x40000000
+	fileGenericRead  = 0x00120089 // FILE_GENERIC_READ
+	fileGenericWrite = 0x00120116 // FILE_GENERIC_WRITE
 	deleteAccess     = 0x00010000
 	shareAll         = 0x00000007
 	attrNormal       = 0x80
@@ -59,11 +60,17 @@ const (
 	dispOverwriteIf  = 5
 	optDir           = 0x00000001
 	optNonDir        = 0x00000040
-	optSyncAlert     = 0x00000020
 	optDeleteOnClose = 0x00001000
 )
 
-// Client 纯标准库实现的 SMB2 客户端（方言 2.0.2/2.1，NTLMv2 认证）
+// smbLog 输出诊断日志（util.Logger 未初始化时静默跳过）
+func smbLog(format string, args ...interface{}) {
+	if util.Logger != nil {
+		util.Logger.Infof("[smb] "+format, args...)
+	}
+}
+
+// Client 纯标准库实现的 SMB2/3 客户端（方言 2.0.2 ~ 3.0.2，NTLMv2 认证）
 type Client struct {
 	cfg       spec.Config
 	conn      net.Conn
@@ -83,18 +90,27 @@ func (c *Client) Open() error {
 	addr := fmt.Sprintf("%s:%d", c.cfg.Host, c.cfg.Port)
 	conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
 	if err != nil {
-		return fmt.Errorf("smb dial: %w", err)
+		smbLog("dial %s failed: %v", addr, err)
+		return fmt.Errorf("smb dial %s: %w", addr, err)
 	}
 	c.conn = conn
+	if err := c.negotiateSMB1(); err != nil {
+		smbLog("SMB1 negotiate failed: %v", err)
+		_ = conn.Close()
+		return fmt.Errorf("smb negotiate: %w", err)
+	}
 	if err := c.negotiate(); err != nil {
+		smbLog("negotiate failed: %v", err)
 		_ = conn.Close()
 		return err
 	}
 	if err := c.sessionSetup(); err != nil {
+		smbLog("session setup failed: %v", err)
 		_ = conn.Close()
 		return err
 	}
 	if err := c.treeConnect(); err != nil {
+		smbLog("tree connect failed: %v", err)
 		_ = conn.Close()
 		return err
 	}
@@ -122,6 +138,7 @@ func (c *Client) roundTrip(command uint16, body, buffer []byte) (uint32, []byte,
 	msg := make([]byte, total)
 	binary.LittleEndian.PutUint32(msg[0:4], protocolID)
 	binary.LittleEndian.PutUint16(msg[4:6], headerLen)
+	binary.LittleEndian.PutUint16(msg[12:14], command)
 	binary.LittleEndian.PutUint16(msg[14:16], 128) // credits
 	binary.LittleEndian.PutUint64(msg[24:32], c.msgID)
 	binary.LittleEndian.PutUint32(msg[36:40], c.treeID)
@@ -149,24 +166,93 @@ func (c *Client) roundTrip(command uint16, body, buffer []byte) (uint32, []byte,
 	return status, resp, nil
 }
 
+// ntStatusName 常见 NTSTATUS 名称（便于诊断）
+var ntStatusName = map[uint32]string{
+	0x00000000: "STATUS_SUCCESS",
+	0xC0000016: "STATUS_MORE_PROCESSING_REQUIRED",
+	0x80000006: "STATUS_NO_MORE_FILES",
+	0xC0000005: "STATUS_ACCESS_VIOLATION",
+	0xC0000022: "STATUS_ACCESS_DENIED",
+	0xC0000034: "STATUS_OBJECT_NAME_NOT_FOUND",
+	0xC0000035: "STATUS_OBJECT_NAME_COLLISION",
+	0xC000003A: "STATUS_OBJECT_PATH_NOT_FOUND",
+	0xC0000043: "STATUS_SHARING_VIOLATION",
+	0xC000006A: "STATUS_WRONG_PASSWORD",
+	0xC0000064: "STATUS_NO_SUCH_USER",
+	0xC000006D: "STATUS_LOGON_FAILURE",
+	0xC0000071: "STATUS_PASSWORD_EXPIRED",
+	0xC0000072: "STATUS_ACCOUNT_DISABLED",
+	0xC000015B: "STATUS_LOGON_TYPE_NOT_GRANTED",
+	0xC00000BB: "STATUS_NOT_SUPPORTED",
+	0xC0000002: "STATUS_NOT_IMPLEMENTED",
+	0xC000000D: "STATUS_INVALID_PARAMETER",
+	0xC000A000: "STATUS_INVALID_SIGNATURE",
+	0xC000019B: "STATUS_SHARE_REDIRECTED",
+	0xC00000CC: "STATUS_BAD_NETWORK_NAME",
+	0xC0000205: "STATUS_INSUFF_SERVER_RESOURCES",
+}
+
 func statusErr(status uint32, op string) error {
+	if name, ok := ntStatusName[status]; ok {
+		return fmt.Errorf("smb: %s failed, ntstatus=0x%08X(%s)", op, status, name)
+	}
 	return fmt.Errorf("smb: %s failed, ntstatus=0x%08X", op, status)
 }
 
 // ---------- NEGOTIATE ----------
 
+// negotiateSMB1 发送 SMB1 NEGOTIATE 引导请求（部分设备如 AirDisk 收到裸 SMB2 会直接 EOF）
+func (c *Client) negotiateSMB1() error {
+	dialectList := []string{"NT LM 0.12", "SMB 2.002", "SMB 2.???"}
+	dialects := []byte{}
+	for _, d := range dialectList {
+		dialects = append(dialects, 0x02)
+		dialects = append(dialects, []byte(d)...)
+		dialects = append(dialects, 0x00)
+	}
+	msg := make([]byte, 32)
+	copy(msg[0:4], []byte{0xFF, 'S', 'M', 'B'})
+	msg[4] = 0x72 // SMB1 NEGOTIATE
+	msg[9] = 0x18 // flags
+	binary.LittleEndian.PutUint16(msg[10:12], 0xC853) // flags2
+	binary.LittleEndian.PutUint16(msg[28:30], 0xFEFF) // pid
+	binary.LittleEndian.PutUint16(msg[30:32], 1)      // mid
+	body := []byte{0x00}                              // wordcount
+	body = append(body, byte(len(dialects)), byte(len(dialects)>>8))
+	body = append(body, dialects...)
+	payload := append(msg, body...)
+
+	n := len(payload)
+	nb := []byte{0x00, byte(n >> 16), byte(n >> 8), byte(n)}
+	if _, err := c.conn.Write(append(nb, payload...)); err != nil {
+		return err
+	}
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(c.conn, hdr); err != nil {
+		return err
+	}
+	respLen := int(hdr[1])<<16 | int(hdr[2])<<8 | int(hdr[3])
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(c.conn, resp); err != nil {
+		return err
+	}
+	smbLog("SMB1 negotiate response: %d bytes, proto=%02x", respLen, resp[0])
+	return nil
+}
+
 func (c *Client) negotiate() error {
-	dialects := []uint32{0x0202, 0x0210} // SMB 2.0.2, SMB 2.1
-	body := make([]byte, 36+len(dialects)*4)
+	// 方言为 uint16 数组；3.1.1 需要 Negotiate Context（预认证完整性），暂不提供
+	dialects := []uint16{0x0202, 0x0210, 0x0300, 0x0302} // 2.0.2 / 2.1 / 3.0 / 3.0.2
+	body := make([]byte, 36+len(dialects)*2)
 	binary.LittleEndian.PutUint16(body[0:2], 36)
 	binary.LittleEndian.PutUint16(body[2:4], uint16(len(dialects)))
 	binary.LittleEndian.PutUint16(body[4:6], 1) // SecurityMode: signing enabled not required
-	binary.LittleEndian.PutUint32(body[8:12], 0x7F)
+	// Capabilities 保持 0：不声明 DFS / 加密等能力
 	guid := make([]byte, 16)
 	_, _ = rand.Read(guid)
 	copy(body[12:28], guid)
 	for i, d := range dialects {
-		binary.LittleEndian.PutUint32(body[36+i*4:], d)
+		binary.LittleEndian.PutUint16(body[36+i*2:], d)
 	}
 	status, resp, err := c.roundTrip(cmdNegotiate, body, nil)
 	if err != nil {
@@ -175,11 +261,15 @@ func (c *Client) negotiate() error {
 	if status != statusSuccess {
 		return statusErr(status, "negotiate")
 	}
+	secMode := binary.LittleEndian.Uint16(resp[headerLen+2:])
 	dialect := binary.LittleEndian.Uint16(resp[headerLen+4:])
-	if dialect != 0x0202 && dialect != 0x0210 {
-		return fmt.Errorf("smb: unsupported dialect negotiated: 0x%04X", dialect)
+	smbLog("negotiate ok: dialect=0x%04X securityMode=0x%02X signingRequired=%v",
+		dialect, secMode, secMode&0x02 != 0)
+	switch dialect {
+	case 0x0202, 0x0210, 0x0300, 0x0302:
+		return nil
 	}
-	return nil
+	return fmt.Errorf("smb: unsupported dialect negotiated: 0x%04X", dialect)
 }
 
 // ---------- SESSION_SETUP ----------
@@ -189,12 +279,13 @@ func (c *Client) sessionSetup() error {
 	if domain == "" {
 		domain = "WORKGROUP"
 	}
-	// 第一轮：Type1
-	status, resp, err := c.sessionSetupRequest(wrapNegTokenInit(type1()))
+	// 第一轮：Type1（AirDisk 等低端设备不支持 SPNEGO，直接发裸 NTLMSSP）
+	status, resp, err := c.sessionSetupRequest(type1())
 	if err != nil {
 		return err
 	}
 	if status == statusSuccess {
+		smbLog("session setup ok (guest/anonymous)")
 		return nil // 匿名/来宾
 	}
 	if status != statusMoreProcessing {
@@ -211,23 +302,25 @@ func (c *Client) sessionSetup() error {
 	if sid := binary.LittleEndian.Uint64(resp[40:48]); sid != 0 {
 		c.sessionID = sid
 	}
-	// 第二轮：Type3
-	status, _, err = c.sessionSetupRequest(wrapNegTokenResp(
-		type3(c.cfg.Username, c.cfg.Password, domain, "", info)))
+	// 第二轮：Type3（裸 NTLMSSP）
+	status, _, err = c.sessionSetupRequest(
+		type3(c.cfg.Username, c.cfg.Password, domain, "", info))
 	if err != nil {
 		return err
 	}
 	if status != statusSuccess {
 		return statusErr(status, "ntlm authenticate")
 	}
+	smbLog("ntlm authenticate ok: user=%s domain=%s sessionID=%d", c.cfg.Username, domain, c.sessionID)
 	return nil
 }
 
 func (c *Client) sessionSetupRequest(gssToken []byte) (uint32, []byte, error) {
-	body := make([]byte, 25)
+	// StructureSize=25 含 Buffer 首字节，固定部分物理长度 24 字节，安全缓冲紧跟其后（偏移 88）
+	body := make([]byte, 24)
 	binary.LittleEndian.PutUint16(body[0:2], 25)
 	body[3] = 1 // SecurityMode
-	binary.LittleEndian.PutUint16(body[12:14], headerLen+25)
+	binary.LittleEndian.PutUint16(body[12:14], headerLen+24)
 	binary.LittleEndian.PutUint16(body[14:16], uint16(len(gssToken)))
 	return c.roundTrip(cmdSessionSetup, body, gssToken)
 }
@@ -250,9 +343,10 @@ func (c *Client) treeConnect() error {
 		return fmt.Errorf("smb: share name required")
 	}
 	name := utf16LE(fmt.Sprintf(`\\%s\%s`, c.cfg.Host, share))
-	body := make([]byte, 9)
+	// StructureSize=9 含 Path 首字节，固定部分物理长度 8 字节，路径紧跟其后（偏移 72）
+	body := make([]byte, 8)
 	binary.LittleEndian.PutUint16(body[0:2], 9)
-	binary.LittleEndian.PutUint16(body[4:6], headerLen+9)
+	binary.LittleEndian.PutUint16(body[4:6], headerLen+8)
 	binary.LittleEndian.PutUint16(body[6:8], uint16(len(name)))
 	status, resp, err := c.roundTrip(cmdTreeConnect, body, name)
 	if err != nil {
@@ -262,6 +356,7 @@ func (c *Client) treeConnect() error {
 		return statusErr(status, "tree connect")
 	}
 	c.treeID = binary.LittleEndian.Uint32(resp[36:40])
+	smbLog("tree connect ok: \\\\%s\\%s treeID=%d", c.cfg.Host, share, c.treeID)
 	return nil
 }
 
@@ -273,21 +368,30 @@ func (c *Client) create(name string, isDir bool, access, disposition, options ui
 	if name != "" {
 		name16 = utf16LE(name)
 	}
-	attrs := uint32(attrNormal)
-	if isDir {
-		attrs = attrDirectory
+	attrs := uint32(0)
+	if disposition == dispCreate || disposition == dispOverwriteIf {
+		attrs = attrNormal
+		if isDir {
+			attrs = attrDirectory
+		}
 	}
+	// AirDisk 要求 body 物理 64 字节（末尾 8 字节 CreateContexts 补零），
+	// 且文件名紧跟在 56 字节固定部分之后（NameOffset=120），8 字节补零放在名字之后
 	body := make([]byte, 56)
 	binary.LittleEndian.PutUint16(body[0:2], 57)
-	body[3] = 2 // ImpersonationLevel = Impersonation
-	binary.LittleEndian.PutUint32(body[20:24], access)
-	binary.LittleEndian.PutUint32(body[24:28], attrs)
-	binary.LittleEndian.PutUint32(body[28:32], shareAll)
-	binary.LittleEndian.PutUint32(body[32:36], disposition)
-	binary.LittleEndian.PutUint32(body[36:40], options)
-	binary.LittleEndian.PutUint16(body[40:42], headerLen+56)
-	binary.LittleEndian.PutUint16(body[42:44], uint16(len(name16)))
-	status, resp, err := c.roundTrip(cmdCreate, body, name16)
+	// body[2]=SecurityFlags, body[3]=RequestedOplockLevel 均为 0
+	binary.LittleEndian.PutUint32(body[4:8], 2) // ImpersonationLevel = Identification
+	binary.LittleEndian.PutUint32(body[24:28], access)
+	binary.LittleEndian.PutUint32(body[28:32], attrs)
+	binary.LittleEndian.PutUint32(body[32:36], shareAll)
+	binary.LittleEndian.PutUint32(body[36:40], disposition)
+	binary.LittleEndian.PutUint32(body[40:44], options)
+	binary.LittleEndian.PutUint16(body[44:46], headerLen+56)
+	binary.LittleEndian.PutUint16(body[46:48], uint16(len(name16)))
+	// CreateContextsOffset/Length 保持 0；buffer = 文件名 + 8 字节补零
+	buffer := make([]byte, len(name16)+8)
+	copy(buffer, name16)
+	status, resp, err := c.roundTrip(cmdCreate, body, buffer)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +448,7 @@ func (c *Client) queryDirOne(fileID []byte, rewind bool) (uint32, []byte, error)
 	pattern := utf16LE("*")
 	body := make([]byte, 32)
 	binary.LittleEndian.PutUint16(body[0:2], 33)
-	body[2] = 3 // FileBothDirectoryInformation
+	body[2] = 38 // FileIdFullDirectoryInformation（AirDisk 固件固定返回此格式）
 	if rewind {
 		body[3] = 0x01 // SL_RESTART_SCAN
 	}
@@ -362,7 +466,7 @@ func (c *Client) List(dir string) ([]model.FileInfo, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("smb: not connected")
 	}
-	fileID, err := c.create(smbName(dir), true, genericRead, dispOpen, optDir|optSyncAlert)
+	fileID, err := c.create(smbName(dir), true, fileGenericRead, dispOpen, optDir)
 	if err != nil {
 		return nil, err
 	}
@@ -400,17 +504,17 @@ func (c *Client) List(dir string) ([]model.FileInfo, error) {
 	return result, nil
 }
 
-// parseBothDir 解析 FileBothDirectoryInformation 链（MS-FSCC 2.4.8）
+// parseBothDir 解析 FileIdFullDirectoryInformation 链（MS-FSCC 2.4.18，文件名在偏移 80）
 func parseBothDir(buf []byte) []model.FileInfo {
 	var out []model.FileInfo
 	off := 0
-	for off+94 <= len(buf) {
+	for off+80 <= len(buf) {
 		next := int(binary.LittleEndian.Uint32(buf[off:]))
 		lastWrite := binary.LittleEndian.Uint64(buf[off+24:])
 		endOfFile := int64(binary.LittleEndian.Uint64(buf[off+40:]))
 		attrs := binary.LittleEndian.Uint32(buf[off+56:])
 		nameLen := int(binary.LittleEndian.Uint32(buf[off+60:]))
-		nameBytes := buf[off+94:]
+		nameBytes := buf[off+80:]
 		if nameLen > len(nameBytes) {
 			break
 		}
@@ -479,9 +583,11 @@ func (r *smbReader) Read(p []byte) (int, error) {
 }
 
 func (r *smbReader) readChunk() (int, error) {
+	// 单次读取限制 64KB：AirDisk 固件 MaxReadSize 较小，请求过大会返回 INVALID_PARAMETER
+	const maxRead = 64 * 1024
 	body := make([]byte, 49)
 	binary.LittleEndian.PutUint16(body[0:2], 49)
-	binary.LittleEndian.PutUint32(body[4:8], uint32(maxRW))
+	binary.LittleEndian.PutUint32(body[4:8], uint32(maxRead))
 	binary.LittleEndian.PutUint64(body[8:16], r.offset)
 	copy(body[16:32], r.fileID)
 	status, resp, err := r.c.roundTrip(cmdRead, body, nil)
@@ -515,14 +621,14 @@ func (r *smbReader) Close() error {
 	return err
 }
 
-// Download 打开文件并返回数据流
+// Download 打开文件并返回数据流（mutex 由 smbReader.Close 释放）
 func (c *Client) Download(p string) (io.ReadCloser, error) {
 	c.mu.Lock()
 	if c.conn == nil {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("smb: not connected")
 	}
-	fileID, err := c.create(smbName(p), false, genericRead, dispOpen, optNonDir|optSyncAlert)
+	fileID, err := c.create(smbName(p), false, fileGenericRead, dispOpen, optNonDir)
 	if err != nil {
 		c.mu.Unlock()
 		return nil, err
@@ -539,8 +645,8 @@ func (c *Client) Upload(p string, r io.Reader, size int64) error {
 	if c.conn == nil {
 		return fmt.Errorf("smb: not connected")
 	}
-	fileID, err := c.create(smbName(p), false, genericRead|genericWrite|deleteAccess,
-		dispOverwriteIf, optNonDir|optSyncAlert)
+	fileID, err := c.create(smbName(p), false, fileGenericRead|fileGenericWrite|deleteAccess,
+		dispOverwriteIf, optNonDir)
 	if err != nil {
 		return err
 	}
@@ -567,8 +673,8 @@ func (c *Client) Upload(p string, r io.Reader, size int64) error {
 }
 
 func (c *Client) writeChunk(fileID, data []byte, offset uint64) error {
-	// body 补齐到 56 字节，使数据相对报文起始 8 字节对齐（64+56=120）
-	const bodyLen = 56
+	// StructureSize=49 含首数据字节，固定部分物理 48 字节，数据紧跟其后（偏移 112）
+	const bodyLen = 48
 	const dataOff = headerLen + bodyLen
 	body := make([]byte, bodyLen)
 	binary.LittleEndian.PutUint16(body[0:2], 49)
@@ -595,7 +701,7 @@ func (c *Client) writeChunk(fileID, data []byte, offset uint64) error {
 func (c *Client) Mkdir(p string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fileID, err := c.create(smbName(p), true, genericRead|genericWrite, dispCreate, optDir|optSyncAlert)
+	fileID, err := c.create(smbName(p), true, fileGenericRead|fileGenericWrite, dispCreate, optDir)
 	if err != nil {
 		return err
 	}
@@ -606,11 +712,11 @@ func (c *Client) Mkdir(p string) error {
 func (c *Client) Remove(p string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fileID, err := c.create(smbName(p), false, genericRead|deleteAccess, dispOpen,
-		optNonDir|optSyncAlert|optDeleteOnClose)
+	fileID, err := c.create(smbName(p), false, fileGenericRead|deleteAccess, dispOpen,
+		optNonDir|optDeleteOnClose)
 	if err != nil {
-		fileID, err = c.create(smbName(p), true, genericRead|deleteAccess, dispOpen,
-			optDir|optSyncAlert|optDeleteOnClose)
+		fileID, err = c.create(smbName(p), true, fileGenericRead|deleteAccess, dispOpen,
+			optDir|optDeleteOnClose)
 		if err != nil {
 			return err
 		}
@@ -622,11 +728,11 @@ func (c *Client) Remove(p string) error {
 func (c *Client) Rename(from, to string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	fileID, err := c.create(smbName(from), false, genericRead|genericWrite|deleteAccess, dispOpen,
-		optNonDir|optSyncAlert)
+	fileID, err := c.create(smbName(from), false, fileGenericRead|fileGenericWrite|deleteAccess, dispOpen,
+		optNonDir)
 	if err != nil {
-		fileID, err = c.create(smbName(from), true, genericRead|genericWrite|deleteAccess, dispOpen,
-			optDir|optSyncAlert)
+		fileID, err = c.create(smbName(from), true, fileGenericRead|fileGenericWrite|deleteAccess, dispOpen,
+			optDir)
 		if err != nil {
 			return err
 		}

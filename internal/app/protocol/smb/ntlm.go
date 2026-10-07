@@ -37,8 +37,8 @@ func type1() []byte {
 	buf := make([]byte, headerLen)
 	copy(buf[0:8], ntlmSig)
 	binary.LittleEndian.PutUint32(buf[8:12], 1)
-	// DomainNameFields / WorkstationFields 均为 0
-	binary.LittleEndian.PutUint32(buf[28:32], clientFlags())
+	// NegotiateFlags 在偏移 12；DomainNameFields(16) / WorkstationFields(24) 均为 0
+	binary.LittleEndian.PutUint32(buf[12:16], clientFlags())
 	return buf
 }
 

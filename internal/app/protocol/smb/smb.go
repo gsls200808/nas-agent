@@ -25,6 +25,7 @@ const (
 	statusNoMoreFiles        = 0x80000006
 	statusObjectNameNotFound = 0xC0000034
 	statusAccessDenied       = 0xC0000022
+	statusEndOfFile          = 0xC0000011
 )
 
 // SMB2 命令
@@ -44,7 +45,7 @@ const (
 const (
 	protocolID = 0x424D53FE // "\xfeSMB"
 	headerLen  = 64
-	maxRW      = 1024 * 1024
+	maxRW      = 64 * 1024 // AirDisk MaxReadSize/MaxWriteSize 均为 64KB，请求过大会报 INVALID_PARAMETER
 )
 
 // 访问掩码/创建参数
@@ -593,6 +594,12 @@ func (r *smbReader) readChunk() (int, error) {
 	status, resp, err := r.c.roundTrip(cmdRead, body, nil)
 	if err != nil {
 		return 0, err
+	}
+	// AirDisk 固件在读到文件末尾时返回 STATUS_END_OF_FILE 而非成功+0 字节，视为正常 EOF
+	if status == statusEndOfFile {
+		r.eof = true
+		r.buf = nil
+		return 0, nil
 	}
 	if status != statusSuccess {
 		return 0, statusErr(status, "read")

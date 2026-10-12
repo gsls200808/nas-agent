@@ -168,8 +168,24 @@ func (s *QuarkService) getClient(userID int64) (*quark.Client, error) {
 	return quark.NewClient(cfg.Cookie), nil
 }
 
+// UploadFile 将本地文件上传到夸克网盘的指定相对目录（自动创建缺失的目录层级）。
+// relDir 如 "影视/流浪地球"，最终文件位于 夸克网盘根目录/影视/流浪地球/<文件名>。
+func (s *QuarkService) UploadFile(userID int64, localPath, relDir string) error {
+	cli, err := s.getClient(userID)
+	if err != nil {
+		return err
+	}
+	parentFid, err := cli.MkdirAll(relDir)
+	if err != nil {
+		return fmt.Errorf("创建夸克目录失败: %w", err)
+	}
+	if _, err := cli.UploadFile(localPath, parentFid); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DownloadFromShare 解析分享链接并下载选中的文件到本地临时目录
-// shareText 可包含提取码；keyword 用于在分享文件中挑选最匹配的音频文件
 // 返回本地文件路径与文件名
 func (s *QuarkService) DownloadFromShare(userID int64, shareText, keyword string) (string, string, error) {
 	cli, err := s.getClient(userID)

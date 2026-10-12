@@ -120,6 +120,24 @@ func migrate() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_config_user ON bot_config(user_id)`,
+		`CREATE TABLE IF NOT EXISTS bot_account (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			name TEXT NOT NULL DEFAULT '',
+			bot_token TEXT NOT NULL DEFAULT '',
+			base_url TEXT NOT NULL DEFAULT '',
+			bot_id TEXT NOT NULL DEFAULT '',
+			ilink_user_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'offline',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_account_bot ON bot_account(bot_id) WHERE bot_id != ''`,
+		// 一次性迁移：旧 bot_config（单微信模型）导入 bot_account
+		`INSERT INTO bot_account(user_id, name, bot_token, base_url, bot_id, ilink_user_id, status)
+		 SELECT user_id, '微信', bot_token, base_url, bot_id, ilink_user_id, status FROM bot_config
+		 WHERE bot_token != '' AND NOT EXISTS(SELECT 1 FROM bot_account)`,
+		// QQ 机器人渠道（bot_account 扩展列，兼容已有库）
 		`CREATE TABLE IF NOT EXISTS quark_config (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id INTEGER NOT NULL DEFAULT 0,
@@ -130,10 +148,91 @@ func migrate() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_quark_config_user ON quark_config(user_id)`,
+		`CREATE TABLE IF NOT EXISTS video_config (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			server_id INTEGER NOT NULL DEFAULT 0,
+			video_dir TEXT NOT NULL DEFAULT '/',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_video_config_user ON video_config(user_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := DB.Exec(s); err != nil {
 			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+	// video_config 拆分为电视/电影两套目录（幂等：仅当列不存在时添加）
+	for _, c := range []struct {
+		name string
+		ddl  string
+	}{
+		{"tv_server_id", "ALTER TABLE video_config ADD COLUMN tv_server_id INTEGER NOT NULL DEFAULT 0"},
+		{"tv_dir", "ALTER TABLE video_config ADD COLUMN tv_dir TEXT NOT NULL DEFAULT '/'"},
+		{"movie_server_id", "ALTER TABLE video_config ADD COLUMN movie_server_id INTEGER NOT NULL DEFAULT 0"},
+		{"movie_dir", "ALTER TABLE video_config ADD COLUMN movie_dir TEXT NOT NULL DEFAULT '/'"},
+	} {
+		rows, err := DB.Query("PRAGMA table_info(video_config)")
+		if err != nil {
+			return fmt.Errorf("migrate: pragma table_info(video_config): %w", err)
+		}
+		exists := false
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("migrate: scan table_info(video_config): %w", err)
+			}
+			if name == c.name {
+				exists = true
+			}
+		}
+		rows.Close()
+		if !exists {
+			if _, err := DB.Exec(c.ddl); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
+		}
+	}
+	// 旧字段 server_id/video_dir 一次性迁移到 tv 列（仅当 tv 列仍为默认值时）
+	_, _ = DB.Exec(`UPDATE video_config SET tv_server_id = server_id, tv_dir = video_dir WHERE tv_server_id = 0 AND (server_id != 0 OR video_dir != '/')`)
+	// bot_account 渠道扩展列（幂等：仅当列不存在时添加）
+	for _, c := range []struct {
+		name string
+		ddl  string
+	}{
+		{"channel", "ALTER TABLE bot_account ADD COLUMN channel TEXT NOT NULL DEFAULT 'wechat'"},
+		{"app_id", "ALTER TABLE bot_account ADD COLUMN app_id TEXT NOT NULL DEFAULT ''"},
+		{"client_secret", "ALTER TABLE bot_account ADD COLUMN client_secret TEXT NOT NULL DEFAULT ''"},
+		{"sandbox", "ALTER TABLE bot_account ADD COLUMN sandbox INTEGER NOT NULL DEFAULT 0"},
+	} {
+		rows, err := DB.Query("PRAGMA table_info(bot_account)")
+		if err != nil {
+			return fmt.Errorf("migrate: pragma table_info: %w", err)
+		}
+		exists := false
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("migrate: scan table_info: %w", err)
+			}
+			if name == c.name {
+				exists = true
+			}
+		}
+		rows.Close()
+		if !exists {
+			if _, err := DB.Exec(c.ddl); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
 		}
 	}
 	return nil

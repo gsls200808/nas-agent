@@ -41,14 +41,21 @@ export const listUsers = () => request.get('/users')
 export const createUser = (data) => request.post('/users', data)
 export const deleteUser = (id) => request.delete(`/users/${id}`)
 
-// ---- 微信机器人 ----
-export const getBotStatus = () => request.get('/bot/status')
-export const getBotQRCode = () => request.post('/bot/login/qrcode')
-export const confirmBotLogin = (data) => request.post('/bot/login/confirm', data)
-export const startBot = () => request.post('/bot/start')
-export const stopBot = () => request.post('/bot/stop')
+// ---- 机器人（微信 / QQ 多账号） ----
+export const getBotAccounts = () => request.get('/bot/accounts')
+export const createBotAccount = (data) => request.post('/bot/account', data)
+export const updateBotAccount = (id, data) => request.put(`/bot/account/${id}`, data)
+export const deleteBotAccount = (id) => request.delete(`/bot/account/${id}`)
+export const getBotQRCode = (id) => request.post(`/bot/login/qrcode/${id}`)
+export const confirmBotLogin = (id, data) => request.post(`/bot/login/confirm/${id}`, data)
+export const startBot = (id) => request.post(`/bot/account/${id}/start`)
+export const stopBot = (id) => request.post(`/bot/account/${id}/stop`)
 export const getMusicConfig = () => request.get('/bot/music/config')
 export const saveMusicConfig = (data) => request.post('/bot/music/config', data)
+
+// ---- 影视目录（看电视/看电影） ----
+export const getVideoConfig = () => request.get('/bot/video/config')
+export const saveVideoConfig = (data) => request.post('/bot/video/config', data)
 
 // ---- 夸克网盘（机器人音乐在线搜索依赖） ----
 export const getQuarkStatus = () => request.get('/bot/quark/status')

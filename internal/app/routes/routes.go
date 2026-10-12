@@ -57,14 +57,21 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 			// 当前用户在某目标服务器下近期使用的存储目录
 			authed.GET("/transfer-recent-dirs", transferCtrl.RecentDirs)
 
-			// 微信机器人
-			authed.GET("/bot/status", botCtrl.Status)
-			authed.POST("/bot/login/qrcode", botCtrl.QRCode)
-			authed.POST("/bot/login/confirm", botCtrl.ConfirmLogin)
-			authed.POST("/bot/start", botCtrl.Start)
-			authed.POST("/bot/stop", botCtrl.Stop)
+			// 微信 / QQ 机器人（多账号）
+			authed.GET("/bot/accounts", botCtrl.Accounts)
+			authed.POST("/bot/account", botCtrl.CreateAccount)
+			authed.PUT("/bot/account/:id", botCtrl.UpdateAccount)
+			authed.DELETE("/bot/account/:id", botCtrl.DeleteAccount)
+			authed.POST("/bot/account/:id/start", botCtrl.Start)
+			authed.POST("/bot/account/:id/stop", botCtrl.Stop)
+			authed.POST("/bot/login/qrcode/:id", botCtrl.QRCode)
+			authed.POST("/bot/login/confirm/:id", botCtrl.ConfirmLogin)
 			authed.GET("/bot/music/config", botCtrl.GetMusicConfig)
 			authed.POST("/bot/music/config", botCtrl.SaveMusicConfig)
+
+			// 影视目录（看电视/看电影）
+			authed.GET("/bot/video/config", botCtrl.GetVideoConfig)
+			authed.POST("/bot/video/config", botCtrl.SaveVideoConfig)
 
 			// 夸克网盘（音乐在线搜索下载依赖）
 			authed.GET("/bot/quark/status", botCtrl.QuarkStatus)

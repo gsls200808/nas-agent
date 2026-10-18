@@ -578,9 +578,13 @@ type mp4Track struct {
 	hasBase    bool
 	// 视频
 	isHEVC  bool
-	spsList [][]byte
-	ppsList [][]byte
-	vpsList [][]byte
+	spsList [][]byte // 只保存首个 SPS（写入 avcC/hvcC）
+	ppsList [][]byte // 只保存首个 PPS（写入 avcC/hvcC）
+	vpsList [][]byte // 只保存首个 VPS（写入 hvcC）
+	curSPS  []byte   // 当前生效的 SPS：与它相同才可从样本中丢弃
+	curPPS  []byte   // 当前生效的 PPS
+	curVPS  []byte   // 当前生效的 VPS
+	needPPS bool     // SPS 刚发生变化，随后的 PPS 必须重新写入样本（in-band）
 	hv      hevcConfig
 	width   int
 	height  int
@@ -650,14 +654,17 @@ func (m *mp4Muxer) onVideoAccessUnit(data []byte, dts, pts int64, hasTS, hevc bo
 			nt := nalu[0] >> 1 & 0x3F // HEVC NALU 头 2 字节，类型占 6 位
 			switch nt {
 			case 32: // VPS
-				m.addVPS(nalu)
-				continue
+				if m.addVPS(nalu) {
+					continue
+				}
 			case 33: // SPS
-				m.addSPS(nalu)
-				continue
+				if m.addSPS(nalu) {
+					continue
+				}
 			case 34: // PPS
-				m.addPPS(nalu)
-				continue
+				if m.addPPS(nalu) {
+					continue
+				}
 			case 35, 38: // AUD / filler，转封装时丢弃
 				continue
 			}
@@ -667,11 +674,13 @@ func (m *mp4Muxer) onVideoAccessUnit(data []byte, dts, pts int64, hasTS, hevc bo
 		} else {
 			switch nalu[0] & 0x1F {
 			case 7: // SPS
-				m.addSPS(nalu)
-				continue
+				if m.addSPS(nalu) {
+					continue
+				}
 			case 8: // PPS
-				m.addPPS(nalu)
-				continue
+				if m.addPPS(nalu) {
+					continue
+				}
 			case 9, 12: // AUD / filler，转封装时丢弃
 				continue
 			case 5: // IDR
@@ -690,51 +699,73 @@ func (m *mp4Muxer) onVideoAccessUnit(data []byte, dts, pts int64, hasTS, hevc bo
 	}
 }
 
-func (m *mp4Muxer) addSPS(nalu []byte) {
+// 参数集处理约定：只有首个 SPS/PPS/VPS 写入 avcC/hvcC（配置盒）。
+// 返回值表示调用方是否可以把这个参数集从样本里丢掉：
+//   true  —— 与当前生效的同一参数集一致，配置盒或样本里已经有了；
+//   false —— 出现/切换了参数集（源流中途插入了分辨率不同的广告/换源），必须保留在样本内（in-band）。
+//
+// 注意：一旦 SPS 发生变化，紧跟其后的 PPS 也必须重新写入样本（needPPS）——即使它的字节
+// 与旧 PPS 完全相同。因为解码器在换 SPS 后需要用样本里的 PPS 重新建立与 SPS 的对应关系，
+// 否则会沿用旧参数集，导致整帧宏块解码失败（top/left block unavailable 等报错）。
+func (m *mp4Muxer) addSPS(nalu []byte) bool {
 	if m.video.isHEVC {
 		if len(nalu) < 10 {
-			return
+			return true
 		}
 	} else if len(nalu) < 4 {
-		return
+		return true
 	}
-	for _, s := range m.video.spsList {
-		if bytes.Equal(s, nalu) {
-			return
-		}
-	}
-	m.video.spsList = append(m.video.spsList, nalu)
-	if m.video.isHEVC {
-		if !m.video.hv.valid {
+	if len(m.video.spsList) == 0 {
+		m.video.spsList = append(m.video.spsList, nalu)
+		m.video.curSPS = nalu
+		if m.video.isHEVC {
 			if cfg, w, h, ok := parseHEVCSPS(nalu); ok {
 				m.video.hv = cfg
 				m.video.width, m.video.height = w, h
 			}
-		}
-	} else if m.video.width == 0 {
-		if w, h, ok := parseSPS(nalu); ok {
+		} else if w, h, ok := parseSPS(nalu); ok {
 			m.video.width, m.video.height = w, h
 		}
+		return true
 	}
+	if bytes.Equal(m.video.curSPS, nalu) {
+		return true
+	}
+	m.video.curSPS = nalu
+	m.video.needPPS = true
+	return false
 }
 
-// addVPS 收集 HEVC VPS（写入 hvcC）
-func (m *mp4Muxer) addVPS(nalu []byte) {
-	for _, v := range m.video.vpsList {
-		if bytes.Equal(v, nalu) {
-			return
-		}
+// addVPS 记录首个 HEVC VPS（写入 hvcC）
+func (m *mp4Muxer) addVPS(nalu []byte) bool {
+	if len(m.video.vpsList) == 0 {
+		m.video.vpsList = append(m.video.vpsList, nalu)
+		m.video.curVPS = nalu
+		return true
 	}
-	m.video.vpsList = append(m.video.vpsList, nalu)
+	if bytes.Equal(m.video.curVPS, nalu) {
+		return true
+	}
+	m.video.curVPS = nalu
+	return false
 }
 
-func (m *mp4Muxer) addPPS(nalu []byte) {
-	for _, p := range m.video.ppsList {
-		if bytes.Equal(p, nalu) {
-			return
-		}
+func (m *mp4Muxer) addPPS(nalu []byte) bool {
+	if m.video.needPPS { // SPS 刚变化过：PPS 必须重新写入样本
+		m.video.needPPS = false
+		m.video.curPPS = nalu
+		return false
 	}
-	m.video.ppsList = append(m.video.ppsList, nalu)
+	if len(m.video.ppsList) == 0 {
+		m.video.ppsList = append(m.video.ppsList, nalu)
+		m.video.curPPS = nalu
+		return true
+	}
+	if bytes.Equal(m.video.curPPS, nalu) {
+		return true
+	}
+	m.video.curPPS = nalu
+	return false
 }
 
 // onAACData 处理音频 PES 负载（连续的 ADTS 帧）

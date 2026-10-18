@@ -53,13 +53,21 @@ func m3u8TargetFileName(t *model.TransferTask) string {
 	return t.TargetFileName
 }
 
+// m3u8Segment 单个分片
+type m3u8Segment struct {
+	url   string
+	ad    bool // 广告分片：下载时跳过
+	group int  // 以 EXT-X-DISCONTINUITY 分隔的分组号（启发式判广告用）
+}
+
 // m3u8Info 解析 m3u8 后的完整信息
 type m3u8Info struct {
-	segments    []string // 分片 URL 列表
-	keyURI      string   // EXT-X-KEY 的 URI（AES-128 加密时存在）
-	keyIV       []byte   // EXT-X-KEY 的 IV（16 字节），无 IV 时由 mediaSequence 推导
-	mediaSeq    int      // EXT-X-MEDIA-SEQUENCE，默认 0
-	isEncrypted bool     // 是否 AES-128 加密
+	segments    []m3u8Segment // 分片列表（含广告标记）
+	keyURI      string        // EXT-X-KEY 的 URI（AES-128 加密时存在）
+	keyIV       []byte        // EXT-X-KEY 的 IV（16 字节），无 IV 时由 mediaSequence 推导
+	mediaSeq    int           // EXT-X-MEDIA-SEQUENCE，默认 0
+	isEncrypted bool          // 是否 AES-128 加密
+	adsRemoved  int           // 判定为广告并被剪掉的分片数
 }
 
 // downloadM3U8 下载 m3u8 → 下载全部分片（支持 AES-128 解密）→ 纯 Go 转封装为 MP4
@@ -73,12 +81,21 @@ func (s *TransferService) downloadM3U8(ctx context.Context, cur *model.TransferT
 	if err != nil {
 		return "", 0, fmt.Errorf("解析 m3u8 失败: %v", err)
 	}
-	if len(info.segments) == 0 {
-		return "", 0, fmt.Errorf("m3u8 无分片")
+	// 剪掉广告分片后的有效分片数（全部判定为广告时直接报错，避免产出空文件）
+	total := 0
+	for _, seg := range info.segments {
+		if !seg.ad {
+			total++
+		}
 	}
-
+	if total == 0 {
+		return "", 0, fmt.Errorf("m3u8 无有效分片")
+	}
+	if info.adsRemoved > 0 {
+		util.Logger.Infof("m3u8 任务 %s 剪掉广告分片 %d 个，剩余 %d 个", taskID, info.adsRemoved, total)
+	}
 	s.mutate(taskID, func(t *model.TransferTask) {
-		t.Segments = len(info.segments)
+		t.Segments = total
 	})
 
 	// 2. 下载全部分片到临时子目录（加密分片先解密再保存）
@@ -101,32 +118,39 @@ func (s *TransferService) downloadM3U8(ctx context.Context, cur *model.TransferT
 		util.Logger.Infof("m3u8 任务 %s 使用 AES-128 加密，已下载密钥", taskID)
 	}
 
-	segFiles := make([]string, 0, len(info.segments))
+	segFiles := make([]string, 0, total)
 	reused := 0
-	for i, segURL := range info.segments {
+	downloaded := 0
+	// 注意：跳过广告分片时保留原始序号 i —— 分片文件名稳定（重试可复用），
+	// 且 AES-128 无显式 IV 时用 mediaSeq+i 推导，序号必须与播放列表一致
+	for i, seg := range info.segments {
 		if ctx.Err() != nil { // 暂停/删除任务时中止
 			return "", 0, errTaskPaused
+		}
+		if seg.ad { // 广告分片：不下载、不进成片
+			continue
 		}
 		segPath := filepath.Join(segDir, fmt.Sprintf("seg_%05d.ts", i))
 		if fi, err := os.Stat(segPath); err == nil && fi.Size() > 0 {
 			reused++ // 上次已下载完成，直接复用
-		} else if err := downloadSegment(ctx, segURL, segPath); err != nil {
-			return "", 0, fmt.Errorf("下载分片 %d/%d 失败: %v", i+1, len(info.segments), err)
+		} else if err := downloadSegment(ctx, seg.url, segPath); err != nil {
+			return "", 0, fmt.Errorf("下载分片 %d/%d 失败: %v", downloaded+1, total, err)
 		}
 		// 解密分片（如果加密）
 		if info.isEncrypted && len(keyData) == 16 {
 			if err := decryptSegmentFile(segPath, keyData, info.keyIV, info.mediaSeq+i); err != nil {
-				return "", 0, fmt.Errorf("解密分片 %d/%d 失败: %v", i+1, len(info.segments), err)
+				return "", 0, fmt.Errorf("解密分片 %d/%d 失败: %v", downloaded+1, total, err)
 			}
 		}
 		segFiles = append(segFiles, segPath)
+		downloaded++
 		s.mutate(taskID, func(t *model.TransferTask) {
-			t.DownloadedSegs = i + 1
-			t.Progress = (i + 1) * m3u8DownloadWeight / len(info.segments)
+			t.DownloadedSegs = downloaded
+			t.Progress = downloaded * m3u8DownloadWeight / total
 		})
 	}
 	if reused > 0 {
-		util.Logger.Infof("m3u8 任务 %s 续跑：复用 %d/%d 个已下载分片", taskID, reused, len(info.segments))
+		util.Logger.Infof("m3u8 任务 %s 续跑：复用 %d/%d 个已下载分片", taskID, reused, total)
 	}
 
 	// 3. 纯 Go 转封装为 MP4（直接读取 TS 分片，无需 ffmpeg，也不用先落盘 combined.ts）
@@ -172,11 +196,16 @@ func fetchM3U8Playlist(ctx context.Context, rawURL string) (*m3u8Info, error) {
 }
 
 // parseM3U8Content 解析 m3u8 内容，返回分片列表和（如果是 master）子播放列表 URL
+// 广告识别：优先认 ppvod 注入标记（# ppvod-ad-injected v1 ... #EXT-X-DISCONTINUITY 包裹的广告块）；
+// 无标记但存在 DISCONTINUITY 时按「分片目录多数派」启发式判定。判定不了就全部保留（宁可不剪）。
 func parseM3U8Content(content string, baseURL *url.URL) (*m3u8Info, string, error) {
 	info := &m3u8Info{mediaSeq: 0}
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 	var streamInf bool
+	var inAd bool          // ppvod 广告块内
+	var adSegsInBlock int  // 当前广告块已标记的分片数
+	var group int          // DISCONTINUITY 分组号
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -192,6 +221,12 @@ func parseM3U8Content(content string, baseURL *url.URL) (*m3u8Info, string, erro
 			resolved := resolveURL(line, baseURL)
 			return nil, resolved, nil
 		}
+		// ppvod 广告注入标记：# ppvod-ad-injected v1 → DISCONTINUITY → 广告分片... → DISCONTINUITY
+		if strings.Contains(line, "ppvod-ad-injected") {
+			inAd = true
+			adSegsInBlock = 0
+			continue
+		}
 		// 解析 EXT-X-KEY
 		if strings.HasPrefix(line, "#EXT-X-KEY:") {
 			parseExtXKey(line, info, baseURL)
@@ -204,17 +239,79 @@ func parseM3U8Content(content string, baseURL *url.URL) (*m3u8Info, string, erro
 			}
 			continue
 		}
+		if strings.HasPrefix(line, "#EXT-X-DISCONTINUITY") {
+			group++
+			if inAd && adSegsInBlock > 0 {
+				inAd = false // 广告块收尾的 DISCONTINUITY
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "#") {
 			continue
 		}
 		// 普通分片 URL
 		resolved := resolveURL(line, baseURL)
-		info.segments = append(info.segments, resolved)
+		seg := m3u8Segment{url: resolved, ad: inAd, group: group}
+		if inAd {
+			adSegsInBlock++
+			info.adsRemoved++
+		}
+		info.segments = append(info.segments, seg)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, "", fmt.Errorf("解析 m3u8 内容失败: %v", err)
 	}
+	// ppvod 标记未命中时，用目录多数派启发式补一刀
+	if info.adsRemoved == 0 {
+		filterAdsByHeuristic(info)
+	}
 	return info, "", nil
+}
+
+// filterAdsByHeuristic 对没有 ppvod 标记、但含 DISCONTINUITY 的播放列表：
+// 统计所有分片 URL 的目录，占绝对多数（> 其余总和）的目录视为正片；
+// 与正片目录不同的分片判定为广告。无法判定（无 DISCONTINUITY 分组、目录单一、无过半多数派）时不动。
+func filterAdsByHeuristic(info *m3u8Info) {
+	if len(info.segments) == 0 {
+		return
+	}
+	dirCount := make(map[string]int)
+	maxGroup := 0
+	for _, seg := range info.segments {
+		dirCount[segmentDir(seg.url)]++
+		if seg.group > maxGroup {
+			maxGroup = seg.group
+		}
+	}
+	if maxGroup == 0 || len(dirCount) < 2 {
+		return // 无 DISCONTINUITY 分组或目录单一，无广告特征
+	}
+	var mainDir string
+	mainCnt := 0
+	total := 0
+	for d, c := range dirCount {
+		total += c
+		if c > mainCnt {
+			mainCnt, mainDir = c, d
+		}
+	}
+	if mainCnt*2 <= total {
+		return // 没有过半多数派，无法可靠区分正片与广告，保守不剪
+	}
+	for i := range info.segments {
+		if segmentDir(info.segments[i].url) != mainDir {
+			info.segments[i].ad = true
+			info.adsRemoved++
+		}
+	}
+}
+
+// segmentDir 取分片 URL 的目录部分作为分组键
+func segmentDir(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		return path.Dir(u.Path)
+	}
+	return raw
 }
 
 // parseExtXKey 解析 #EXT-X-KEY 行，提取 URI、METHOD、IV

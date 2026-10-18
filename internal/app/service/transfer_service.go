@@ -24,6 +24,7 @@ import (
 	"nas-agent/internal/app/model"
 	"nas-agent/internal/app/protocol/ftp"
 	"nas-agent/internal/app/protocol/spec"
+	"nas-agent/internal/pkg/quark"
 )
 
 // 转存任务状态
@@ -89,6 +90,7 @@ var sourceHTTPClient = &http.Client{
 type TransferService struct {
 	defaultDir string        // 默认本地暂存目录
 	sem        chan struct{} // 并发闸门
+	quark      *QuarkService // 夸克分享转存用（按任务发起用户取 cookie）
 
 	mu    sync.RWMutex
 	tasks map[string]*model.TransferTask
@@ -108,6 +110,7 @@ func NewTransferService(defaultDir string) *TransferService {
 	s := &TransferService{
 		defaultDir: defaultDir,
 		sem:        make(chan struct{}, maxConcurrentTransfer),
+		quark:      NewQuarkService(),
 		tasks:      make(map[string]*model.TransferTask),
 		ids:        make([]string, 0, maxTaskHistory),
 		dirty:      make(map[string]bool),
@@ -175,8 +178,9 @@ func (s *TransferService) save(t *model.TransferTask) {
 
 // TransferRequest 创建转存任务的入参
 type TransferRequest struct {
-	UserID         int64  // 发起任务的登录用户，用于记录该用户的近期使用目录
-	SourceURL      string // 下载地址（http/https/ftp/m3u8）
+	UserID         int64  // 发起任务的登录用户，用于记录该用户的近期使用目录（夸克分享转存需用其 cookie）
+	SourceURL      string // 下载地址（http/https/ftp/m3u8/夸克分享链接）
+	SubPath        string // 夸克分享内的子目录路径（留空 = 分享根目录）
 	TargetServerID int64  // 目标服务器
 	TargetDir      string // 目标服务器上的存储目录
 	LocalDir       string // 本地暂存目录，留空用默认值
@@ -189,21 +193,31 @@ func (s *TransferService) Create(req TransferRequest) (*model.TransferTask, erro
 	if sourceURL == "" {
 		return nil, fmt.Errorf("下载地址不能为空")
 	}
-	u, err := parseSourceURL(sourceURL)
-	if err != nil {
-		return nil, err
+	// 夸克分享链接（可带提取码文本）走滚动转存，其余按直链解析
+	quarkShare := isQuarkShareSource(sourceURL)
+	sourceType := "http"
+	if quarkShare {
+		if _, _, err := quark.ParseShareText(sourceURL); err != nil {
+			return nil, err
+		}
+		if _, err := s.quark.getClient(req.UserID); err != nil {
+			return nil, err
+		}
+		sourceType = "quark_share"
+	} else {
+		u, err := parseSourceURL(sourceURL)
+		if err != nil {
+			return nil, err
+		}
+		if strings.ToLower(u.Scheme) == "ftp" {
+			sourceType = "ftp"
+		} else if isM3U8URL(u) {
+			sourceType = "m3u8"
+		}
 	}
 	dst, err := dao.GetServer(req.TargetServerID)
 	if err != nil {
 		return nil, fmt.Errorf("目标服务器不存在: %d", req.TargetServerID)
-	}
-
-	// 判断下载源类型
-	sourceType := "http"
-	if strings.ToLower(u.Scheme) == "ftp" {
-		sourceType = "ftp"
-	} else if isM3U8URL(u) {
-		sourceType = "m3u8"
 	}
 
 	targetDir := strings.TrimSpace(req.TargetDir)
@@ -229,8 +243,10 @@ func (s *TransferService) Create(req TransferRequest) (*model.TransferTask, erro
 
 	task := &model.TransferTask{
 		ID:               newTaskID(),
+		UserID:           req.UserID,
 		SourceURL:        sourceURL,
 		SourceType:       sourceType,
+		SubPath:          normalizeSubPath(req.SubPath),
 		TargetServerID:   dst.ID,
 		TargetServerName: dst.Name,
 		TargetDir:        targetDir,
@@ -345,7 +361,12 @@ func (s *TransferService) Retry(id, mode string) (*model.TransferTask, error) {
 		}
 		step = cur.FailedStep
 		if step == "" {
-			return nil, fmt.Errorf("该任务未记录失败步骤，无法从失败步骤继续")
+			// 夸克分享任务按集数清单续跑，不需要失败步骤
+			if cur.SourceType == "quark_share" {
+				step = StepDownload
+			} else {
+				return nil, fmt.Errorf("该任务未记录失败步骤，无法从失败步骤继续")
+			}
 		}
 	default:
 		return nil, fmt.Errorf("不支持的重试方式: %s", mode)
@@ -509,6 +530,12 @@ func (s *TransferService) cleanLocal(t *model.TransferTask) {
 	if t.LocalDir != "" {
 		_ = os.RemoveAll(filepath.Join(t.LocalDir, t.ID+"_segs"))
 		_ = os.Remove(filepath.Join(t.LocalDir, t.ID+"_output.mp4"))
+		// 夸克分享转存的单集暂存文件
+		if files, err := filepath.Glob(filepath.Join(t.LocalDir, t.ID+"_ep_*")); err == nil {
+			for _, f := range files {
+				_ = os.Remove(f)
+			}
+		}
 	}
 	if t.LocalPath != "" && t.LocalPath != t.LocalDir {
 		_ = os.Remove(t.LocalPath)
@@ -667,6 +694,11 @@ func (s *TransferService) transfer(ctx context.Context, id string) error {
 	cur, ok := s.Get(id)
 	if !ok {
 		return fmt.Errorf("任务不存在")
+	}
+
+	// 夸克分享子目录滚动转存：转存一集 → 下载一集 → 转存到目标服务器 → 删除网盘副本
+	if cur.SourceType == "quark_share" {
+		return s.transferQuarkShare(ctx, cur, id)
 	}
 
 	var localPath string

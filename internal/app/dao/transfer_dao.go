@@ -8,7 +8,8 @@ import (
 	"nas-agent/internal/app/model"
 )
 
-const transferTaskCols = `id, source_url, source_type, target_server_id, target_server_name,
+const transferTaskCols = `id, user_id, source_url, source_type, sub_path, episodes,
+	target_server_id, target_server_name,
 	target_dir, target_path, target_file_name, local_dir, local_path, file_name,
 	size, downloaded, uploaded, segments, downloaded_segs,
 	status, phase, progress, failed_step, error, created_at, finished_at`
@@ -24,8 +25,9 @@ func SaveTransferTask(t *model.TransferTask) error {
 	}
 	_, err := DB.Exec(`INSERT OR REPLACE INTO transfer_task
 		(`+transferTaskCols+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.SourceURL, t.SourceType, t.TargetServerID, t.TargetServerName,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.UserID, t.SourceURL, t.SourceType, t.SubPath, t.Episodes,
+		t.TargetServerID, t.TargetServerName,
 		t.TargetDir, t.TargetPath, t.TargetFileName, t.LocalDir, t.LocalPath, t.FileName,
 		t.Size, t.Downloaded, t.Uploaded, t.Segments, t.DownloadedSegs,
 		t.Status, t.Phase, t.Progress, t.FailedStep, t.Error, t.CreatedAt, finishedAt)
@@ -99,7 +101,8 @@ func scanTransferTask(r rowScanner) (*model.TransferTask, error) {
 		t          model.TransferTask
 		finishedAt sql.NullTime
 	)
-	err := r.Scan(&t.ID, &t.SourceURL, &t.SourceType, &t.TargetServerID, &t.TargetServerName,
+	err := r.Scan(&t.ID, &t.UserID, &t.SourceURL, &t.SourceType, &t.SubPath, &t.Episodes,
+		&t.TargetServerID, &t.TargetServerName,
 		&t.TargetDir, &t.TargetPath, &t.TargetFileName, &t.LocalDir, &t.LocalPath, &t.FileName,
 		&t.Size, &t.Downloaded, &t.Uploaded, &t.Segments, &t.DownloadedSegs,
 		&t.Status, &t.Phase, &t.Progress, &t.FailedStep, &t.Error, &t.CreatedAt, &finishedAt)

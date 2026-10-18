@@ -48,6 +48,7 @@ func Register(r *gin.Engine, auth *service.AuthService, defaultDownloadDir strin
 			// 转存任务：下载地址（http/ftp/m3u8）→ 本地暂存目录 → 转存到目标服务器的存储目录
 			authed.POST("/transfer-tasks", transferCtrl.Create)
 			authed.GET("/transfer-tasks", transferCtrl.List)
+			authed.POST("/transfer-tasks/quark/share-dirs", transferCtrl.QuarkShareDirs)
 			authed.GET("/transfer-tasks/:taskId", transferCtrl.Get)
 			authed.POST("/transfer-tasks/:taskId/retry", transferCtrl.Retry)
 			authed.POST("/transfer-tasks/:taskId/pause", transferCtrl.Pause)

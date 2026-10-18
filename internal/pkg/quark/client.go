@@ -31,6 +31,11 @@ const (
 // chromeUA 模拟浏览器请求
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
+// clientUA 夸克 PC 客户端 UA：取下载地址和实际下载时使用。
+// 官方对浏览器 UA 的大文件下载会返回 23018（download file size limit），
+// 伪装客户端后可正常获取直链（参考 alist quark_uc 驱动、gopeed 夸克扩展）。
+const clientUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+
 // ShareFile 分享列表中的文件
 type ShareFile struct {
 	Fid           string
@@ -101,6 +106,11 @@ func (c *Client) cookieHeader() string {
 // request 发起 API 请求并解析 JSON 响应
 // 返回完整响应 map；调用方自行校验 code/status
 func (c *Client) request(method, rawURL string, body interface{}) (map[string]interface{}, error) {
+	return c.requestWithUA(method, rawURL, body, chromeUA)
+}
+
+// requestWithUA 使用指定 User-Agent 发起 API 请求
+func (c *Client) requestWithUA(method, rawURL string, body interface{}, ua string) (map[string]interface{}, error) {
 	// drive 域名需附加通用 query 参数
 	if strings.Contains(rawURL, "quark.cn/1/clouddrive") {
 		u, err := url.Parse(rawURL)
@@ -133,7 +143,7 @@ func (c *Client) request(method, rawURL string, body interface{}) (map[string]in
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 	req.Header.Set("Referer", PanDomain+"/list")
 	req.Header.Set("Origin", PanDomain)
-	req.Header.Set("User-Agent", chromeUA)
+	req.Header.Set("User-Agent", ua)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -351,10 +361,11 @@ func (c *Client) queryTask(taskID string) (map[string]interface{}, error) {
 }
 
 // GetDownloadURL 获取文件下载地址（兼容同步/异步任务）
+// 使用夸克 PC 客户端 UA，避免大文件被以 23018（download file size limit）拒绝
 func (c *Client) GetDownloadURL(fid string) (string, error) {
-	resp, err := c.request("POST", DriveDomain+"/1/clouddrive/file/download", map[string]interface{}{
+	resp, err := c.requestWithUA("POST", DriveDomain+"/1/clouddrive/file/download", map[string]interface{}{
 		"fids": []string{fid},
-	})
+	}, clientUA)
 	if err != nil {
 		return "", fmt.Errorf("获取下载地址失败: %w", err)
 	}
@@ -415,11 +426,26 @@ func (c *Client) GetDownloadURL(fid string) (string, error) {
 
 // DownloadFile 下载文件到本地路径（下载域校验需要完整 cookie 与浏览器头）
 func (c *Client) DownloadFile(downloadURL, destPath string) error {
+	w := &fileWriter{path: destPath}
+	_, err := c.DownloadFileTo(downloadURL, w)
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(destPath)
+	}
+	return err
+}
+
+// DownloadFileTo 下载文件写入任意 writer，返回写入字节数。
+// 供调用方包装 writer 实现进度回调与取消（大文件下载不设总超时）。
+func (c *Client) DownloadFileTo(downloadURL string, dst io.Writer) (int64, error) {
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return 0, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("User-Agent", chromeUA)
+	// 与取直链时保持同一客户端 UA（官方客户端下载校验）
+	req.Header.Set("User-Agent", clientUA)
 	req.Header.Set("Referer", PanDomain+"/")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
@@ -432,13 +458,42 @@ func (c *Client) DownloadFile(downloadURL, destPath string) error {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("下载请求失败: %w", err)
+		return 0, fmt.Errorf("下载请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
 	}
-	return saveReaderToFile(resp.Body, destPath)
+	return io.Copy(dst, resp.Body)
+}
+
+// fileWriter 把写入落到本地文件（DownloadFile 的默认目标）
+type fileWriter struct {
+	path string
+	f    *os.File
+}
+
+func (w *fileWriter) Write(p []byte) (int, error) {
+	if w.f == nil {
+		f, err := os.Create(w.path)
+		if err != nil {
+			return 0, fmt.Errorf("创建本地文件失败: %w", err)
+		}
+		w.f = f
+	}
+	return w.f.Write(p)
+}
+
+func (w *fileWriter) Close() error {
+	if w.f == nil {
+		// 未写入任何数据时也要生成空文件
+		f, err := os.Create(w.path)
+		if err != nil {
+			return fmt.Errorf("创建本地文件失败: %w", err)
+		}
+		return f.Close()
+	}
+	return w.f.Close()
 }
 
 // DeleteFiles 删除自己网盘中的文件（清理转存副本）
@@ -456,6 +511,63 @@ func (c *Client) DeleteFiles(fids []string) error {
 	}
 	if _, err := checkResp(resp, "删除文件"); err != nil {
 		return err
+	}
+	return nil
+}
+
+// Capacity 网盘容量（字节）
+type Capacity struct {
+	Total int64 // 总容量
+	Used  int64 // 已使用容量
+}
+
+// GetCapacity 查询网盘总容量与已用容量。
+// 夸克不同版本接口字段位置不一致，这里按候选接口 + 递归查找字段做容错解析。
+func (c *Client) GetCapacity() (*Capacity, error) {
+	for _, ep := range []string{"/1/clouddrive/capacity", "/1/clouddrive/member"} {
+		resp, err := c.request("GET", DriveDomain+ep, nil)
+		if err != nil {
+			continue
+		}
+		if cap := findCapacity(resp["data"]); cap != nil {
+			return cap, nil
+		}
+	}
+	return nil, fmt.Errorf("获取网盘容量失败")
+}
+
+// findCapacity 在响应数据中递归查找 total/used 容量字段
+func findCapacity(v interface{}) *Capacity {
+	var total, used int64
+	var hasTotal, hasUsed bool
+	var walk func(node interface{})
+	walk = func(node interface{}) {
+		obj, ok := node.(map[string]interface{})
+		if !ok {
+			if arr, ok := node.([]interface{}); ok {
+				for _, item := range arr {
+					walk(item)
+				}
+			}
+			return
+		}
+		for k, val := range obj {
+			switch strings.ToLower(k) {
+			case "total_size", "total_capacity":
+				if n, ok := val.(float64); ok && n > 0 && !hasTotal {
+					total, hasTotal = int64(n), true
+				}
+			case "used_size", "use_capacity":
+				if n, ok := val.(float64); ok && n >= 0 && !hasUsed {
+					used, hasUsed = int64(n), true
+				}
+			}
+			walk(val)
+		}
+	}
+	walk(v)
+	if hasTotal && hasUsed {
+		return &Capacity{Total: total, Used: used}
 	}
 	return nil
 }
@@ -904,20 +1016,6 @@ func fileMD5(p string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// saveReaderToFile 将流写入本地文件
-func saveReaderToFile(rc io.Reader, destPath string) error {
-	f, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("创建本地文件失败: %w", err)
-	}
-	if _, err := io.Copy(f, rc); err != nil {
-		f.Close()
-		os.Remove(destPath)
-		return fmt.Errorf("写入文件失败: %w", err)
-	}
-	return f.Close()
 }
 
 // truncate 截断字符串用于错误信息

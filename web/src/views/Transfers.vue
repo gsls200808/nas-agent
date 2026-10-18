@@ -4,7 +4,7 @@
       <el-button type="primary" @click="openCreate">新建转存任务</el-button>
       <el-button @click="refresh" :loading="loading">刷新</el-button>
       <span style="color:#909399;font-size:12px">
-        支持 HTTP / FTP 直链下载及 m3u8 流媒体（下载全部分片合并为 MP4 后转存）
+        支持 HTTP / FTP 直链、m3u8 流媒体（下载全部分片合并为 MP4），以及夸克网盘分享链接逐集滚动转存
       </span>
     </div>
 
@@ -15,9 +15,11 @@
     </el-tabs>
 
     <el-table :data="filteredTasks" v-loading="loading" stripe :empty-text="emptyText">
-      <el-table-column label="类型" width="70">
+      <el-table-column label="类型" width="90">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.sourceType === 'm3u8' ? 'warning' : 'info'">{{ row.sourceType || 'http' }}</el-tag>
+          <el-tag size="small" :type="row.sourceType === 'm3u8' ? 'warning' : (row.sourceType === 'quark_share' ? 'success' : 'info')">
+            {{ row.sourceType === 'quark_share' ? '夸克分享' : (row.sourceType || 'http') }}
+          </el-tag>
         </template>
       </el-table-column>
       <el-table-column label="文件" min-width="160" show-overflow-tooltip>
@@ -60,7 +62,7 @@
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="restart">从头开始</el-dropdown-item>
-                <el-dropdown-item command="resume" :disabled="!row.failedStep">
+                <el-dropdown-item command="resume" :disabled="!row.failedStep && row.sourceType !== 'quark_share'">
                   从失败步骤开始{{ row.failedStep ? `（${stepText(row.failedStep)}）` : '' }}
                 </el-dropdown-item>
               </el-dropdown-menu>
@@ -77,7 +79,24 @@
       <el-form label-width="100px">
         <el-form-item label="下载地址">
           <el-input v-model="form.sourceUrl" type="textarea" :rows="2"
-                    placeholder="支持 http / https / ftp 直链及 m3u8 地址，如 http://example.com/a.zip 或 https://example.com/video.m3u8" />
+                    placeholder="支持 http / https / ftp 直链、m3u8 地址，以及夸克网盘分享链接（可带提取码），如 https://pan.quark.cn/s/xxxx" />
+        </el-form-item>
+        <el-form-item v-if="isQuarkShare" label="分享子目录">
+          <div style="width:100%">
+            <el-cascader
+              v-model="shareCascaderValue"
+              :props="shareCascaderProps"
+              :key="shareCascaderKey"
+              placeholder="不选表示分享根目录，点击可展开逐级选择"
+              clearable
+              filterable
+              style="width:100%"
+              @change="onShareDirChange"
+            />
+            <div v-if="shareDirSummary" style="font-size:12px;color:#909399;margin-top:4px">
+              该目录直接包含 {{ shareDirSummary.count }} 个视频（{{ fmtSize(shareDirSummary.size) }}），子文件夹会自动递归
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="目标服务器">
           <el-select v-model="form.targetServerId" placeholder="选择文件服务器" style="width:100%" @change="onServerChange">
@@ -110,7 +129,7 @@
             />
           </div>
         </el-form-item>
-        <el-form-item label="目标文件名">
+        <el-form-item v-if="!isQuarkShare" label="目标文件名">
           <el-input v-model="form.targetFileName" placeholder="留空使用源文件名；m3u8 自动加 .mp4 后缀">
             <template #append>
               <span style="font-size:12px;color:#909399">.mp4</span>
@@ -122,7 +141,8 @@
         </el-form-item>
         <el-form-item label="">
           <span style="color:#909399;font-size:12px">
-            流程：下载到本地暂存目录（m3u8 会下载全部分片并合并为 MP4）→ 转存到目标存储目录；成功后自动删除本地暂存文件，失败时保留
+            直链/m3u8：下载到本地暂存目录（m3u8 会下载全部分片并合并为 MP4）→ 转存到目标存储目录；成功后自动删除本地暂存文件，失败时保留。<br>
+            夸克分享：先展开并选择子目录（不选 = 分享根目录），按文件名排序列出全部视频，逐集「转存到网盘 → 下载 → 转存到目标服务器 → 删除网盘副本」，网盘只占一集空间
           </span>
         </el-form-item>
       </el-form>
@@ -135,10 +155,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
-import { listServers, createTransfer, listTransferTasks, listFiles, retryTransferTask, listRecentDirs, pauseTransferTask, startTransferTask, deleteTransferTask } from '../api'
+import { listServers, createTransfer, listTransferTasks, listFiles, listQuarkShareDirs, retryTransferTask, listRecentDirs, pauseTransferTask, startTransferTask, deleteTransferTask } from '../api'
 
 const servers = ref([])
 const tasks = ref([])
@@ -163,7 +183,67 @@ const emptyText = computed(() => (
 
 const createVisible = ref(false)
 const submitting = ref(false)
-const form = ref({ sourceUrl: '', targetServerId: null, targetDir: '/', localDir: '', targetFileName: '' })
+const form = ref({ sourceUrl: '', subPath: '', targetServerId: null, targetDir: '/', localDir: '', targetFileName: '' })
+
+// 夸克分享链接：显示子目录选择，并按逐集滚动转存处理
+const isQuarkShare = computed(() => {
+  const url = form.value.sourceUrl || ''
+  return url.includes('pan.quark.cn') && url.includes('/s/')
+})
+
+// 夸克分享子目录级联选择（懒加载分享目录树）
+const shareCascaderValue = ref([])
+const shareCascaderKey = ref(0)
+const shareDirSummary = ref(null) // 所选目录直接包含的视频数量与大小
+let shareDirFids = {} // 路径 → fid，选中目录后据此查询视频统计
+
+const shareCascaderProps = shallowRef({
+  lazy: true,
+  checkStrictly: true,
+  lazyLoad: async (node, resolve) => {
+    if (!isQuarkShare.value) {
+      resolve([])
+      return
+    }
+    const pdirFid = node.level === 0 ? '0' : (node.data && node.data.fid)
+    try {
+      const data = (await listQuarkShareDirs(form.value.sourceUrl.trim(), pdirFid || '0')) || {}
+      if (node.level === 0 && !form.value.subPath) {
+        shareDirSummary.value = { count: data.videoCount || 0, size: data.videoSize || 0 }
+      }
+      const dirs = (data.dirs || []).map(d => {
+        const value = node.level === 0 ? '/' + d.name : node.data.value + '/' + d.name
+        shareDirFids[value] = d.fid
+        return { label: d.name, value, fid: d.fid }
+      })
+      resolve(dirs)
+    } catch (e) {
+      resolve([])
+    }
+  }
+})
+
+async function onShareDirChange(val) {
+  const picked = Array.isArray(val) && val.length > 0 ? val[val.length - 1] : ''
+  form.value.subPath = picked
+  shareDirSummary.value = null
+  if (!picked) return
+  const fid = shareDirFids[picked]
+  if (!fid) return
+  try {
+    const data = (await listQuarkShareDirs(form.value.sourceUrl.trim(), fid)) || {}
+    shareDirSummary.value = { count: data.videoCount || 0, size: data.videoSize || 0 }
+  } catch (e) { /* 错误提示由请求拦截器统一处理 */ }
+}
+
+// 修改分享链接后重置已选目录与缓存
+watch(() => form.value.sourceUrl, () => {
+  shareCascaderValue.value = []
+  form.value.subPath = ''
+  shareDirSummary.value = null
+  shareDirFids = {}
+  shareCascaderKey.value++
+})
 
 // 级联选择器
 const cascaderValue = ref([])
@@ -273,9 +353,13 @@ function pathToCascaderValue(p) {
 }
 
 function openCreate() {
-  form.value = { sourceUrl: '', targetServerId: servers.value[0]?.id || null, targetDir: '/', localDir: '', targetFileName: '' }
+  form.value = { sourceUrl: '', subPath: '', targetServerId: servers.value[0]?.id || null, targetDir: '/', localDir: '', targetFileName: '' }
   cascaderValue.value = []
   cascaderKey.value++
+  shareCascaderValue.value = []
+  shareDirSummary.value = null
+  shareDirFids = {}
+  shareCascaderKey.value++
   createVisible.value = true
   loadRecentDirs()
 }
@@ -294,10 +378,11 @@ async function submit() {
   try {
     await createTransfer({
       sourceUrl,
+      subPath: isQuarkShare.value ? form.value.subPath.trim() : '',
       targetServerId: form.value.targetServerId,
       targetDir: form.value.targetDir || '/',
       localDir: form.value.localDir.trim(),
-      targetFileName: form.value.targetFileName.trim()
+      targetFileName: isQuarkShare.value ? '' : form.value.targetFileName.trim()
     })
     createVisible.value = false
     ElMessage.success('转存任务已创建')
@@ -392,6 +477,14 @@ function phaseText(row) {
   if (row.status === 'success') return '已完成，本地暂存文件已清理'
   if (row.status === 'failed') {
     return (row.failedStep ? `失败于${stepText(row.failedStep)}步骤：` : '失败：') + (row.error || '')
+  }
+  if (row.sourceType === 'quark_share') {
+    const total = row.segments || 0
+    const done = row.downloadedSegs || 0
+    const cur = total > 0 ? Math.min(done + 1, total) : done
+    const ep = row.fileName ? `：${row.fileName}` : ''
+    if (row.phase === 'transferring') return `第 ${cur}/${total} 集转存中${ep}（已完成 ${done} 集）`
+    return `第 ${cur}/${total} 集下载中${ep}（已完成 ${done} 集）`
   }
   if (row.phase === 'merging') {
     return row.sourceType === 'm3u8' ? '合并 MP4 中…' : '处理中…'

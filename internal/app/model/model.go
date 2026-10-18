@@ -51,8 +51,11 @@ type FileInfo struct {
 // TransferTask 转存任务：从下载地址下载到本地暂存目录 → 转存到目标服务器的存储目录
 type TransferTask struct {
 	ID               string     `json:"id"`                       // 任务 ID
-	SourceURL        string     `json:"sourceUrl"`                // 下载地址（http/https/ftp/m3u8）
-	SourceType       string     `json:"sourceType"`               // http / ftp / m3u8
+	UserID           int64      `json:"-"`                        // 发起任务的登录用户（夸克分享转存需用其网盘 cookie）
+	SourceURL        string     `json:"sourceUrl"`                // 下载地址（http/https/ftp/m3u8/夸克分享）
+	SourceType       string     `json:"sourceType"`               // http / ftp / m3u8 / quark_share
+	SubPath          string     `json:"subPath,omitempty"`        // 夸克分享内的子目录路径（空 = 分享根目录）
+	Episodes         string     `json:"episodes,omitempty"`       // 夸克分享转存的集数清单（JSON）
 	TargetServerID   int64      `json:"targetServerId"`           // 目标服务器
 	TargetServerName string     `json:"targetServerName"`         // 目标服务器名称
 	TargetDir        string     `json:"targetDir"`                // 目标存储目录
@@ -61,11 +64,11 @@ type TransferTask struct {
 	LocalDir         string     `json:"localDir"`                 // 本地暂存目录
 	LocalPath        string     `json:"localPath"`                // 本地暂存文件路径（失败时保留）
 	FileName         string     `json:"fileName"`                 // 文件名
-	Size             int64      `json:"size"`                     // 文件大小（未知为 -1）
+	Size             int64      `json:"size"`                     // 文件大小（未知为 -1；多集任务为总大小）
 	Downloaded       int64      `json:"downloaded"`               // 已下载字节数
 	Uploaded         int64      `json:"uploaded"`                 // 已转存字节数
-	Segments         int        `json:"segments"`                 // m3u8 总分片数
-	DownloadedSegs   int        `json:"downloadedSegs"`           // m3u8 已下载分片数
+	Segments         int        `json:"segments"`                 // m3u8 总分片数 / 夸克分享总集数
+	DownloadedSegs   int        `json:"downloadedSegs"`           // m3u8 已下载分片数 / 夸克分享已完成集数
 	Status           string     `json:"status"`                   // pending / running / paused / success / failed
 	Phase            string     `json:"phase"`                    // pending / downloading / merging / transferring / done
 	Progress         int        `json:"progress"`                 // 0-100

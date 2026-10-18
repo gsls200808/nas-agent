@@ -33,6 +33,9 @@ export const pauseTransferTask = (taskId) => request.post(`/transfer-tasks/${tas
 export const startTransferTask = (taskId) => request.post(`/transfer-tasks/${taskId}/start`)
 // 删除任务（运行中的先中止，本地暂存文件一并清理）
 export const deleteTransferTask = (taskId) => request.delete(`/transfer-tasks/${taskId}`)
+// 浏览夸克分享中的子目录（pdirFid 为 '0' 表示分享根目录），用于新建任务时交互选择
+export const listQuarkShareDirs = (sourceUrl, pdirFid) =>
+  request.post('/transfer-tasks/quark/share-dirs', { sourceUrl, pdirFid })
 // 当前登录用户在某目标服务器下近期使用的存储目录（最多 10 个）
 export const listRecentDirs = (serverId) => request.get('/transfer-recent-dirs', { params: { serverId } })
 

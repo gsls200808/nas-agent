@@ -56,8 +56,11 @@ func migrate() error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS transfer_task (
 			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL DEFAULT 0,
 			source_url TEXT NOT NULL DEFAULT '',
 			source_type TEXT NOT NULL DEFAULT '',
+			sub_path TEXT NOT NULL DEFAULT '',
+			episodes TEXT NOT NULL DEFAULT '',
 			target_server_id INTEGER NOT NULL DEFAULT 0,
 			target_server_name TEXT NOT NULL DEFAULT '',
 			target_dir TEXT NOT NULL DEFAULT '',
@@ -223,6 +226,40 @@ func migrate() error {
 			if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
 				rows.Close()
 				return fmt.Errorf("migrate: scan table_info: %w", err)
+			}
+			if name == c.name {
+				exists = true
+			}
+		}
+		rows.Close()
+		if !exists {
+			if _, err := DB.Exec(c.ddl); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
+		}
+	}
+	// transfer_task 夸克分享转存扩展列（幂等：仅当列不存在时添加）
+	for _, c := range []struct {
+		name string
+		ddl  string
+	}{
+		{"user_id", "ALTER TABLE transfer_task ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0"},
+		{"sub_path", "ALTER TABLE transfer_task ADD COLUMN sub_path TEXT NOT NULL DEFAULT ''"},
+		{"episodes", "ALTER TABLE transfer_task ADD COLUMN episodes TEXT NOT NULL DEFAULT ''"},
+	} {
+		rows, err := DB.Query("PRAGMA table_info(transfer_task)")
+		if err != nil {
+			return fmt.Errorf("migrate: pragma table_info(transfer_task): %w", err)
+		}
+		exists := false
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("migrate: scan table_info(transfer_task): %w", err)
 			}
 			if name == c.name {
 				exists = true

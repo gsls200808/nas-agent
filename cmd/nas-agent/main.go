@@ -76,6 +76,12 @@ func main() {
 			if ct == "" {
 				ct = "application/octet-stream"
 			}
+			// 带哈希的构建产物可长期缓存；index.html 不缓存，保证发版后立即生效
+			if strings.HasPrefix(p, "assets/") {
+				c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				c.Header("Cache-Control", "no-cache")
+			}
 			c.Data(http.StatusOK, ct, data)
 			return
 		}
@@ -84,6 +90,7 @@ func main() {
 			c.String(http.StatusNotFound, "前端资源未构建：请先在 web/ 目录执行 npm run build")
 			return
 		}
+		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	})
 

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,7 +22,8 @@ func NewTransferController(svc *service.TransferService) *TransferController {
 }
 
 type transferReq struct {
-	SourceURL      string `json:"sourceUrl"`      // 下载地址（http/https/ftp/m3u8）
+	SourceURL      string `json:"sourceUrl"`      // 下载地址（http/https/ftp/m3u8/夸克分享链接）
+	SubPath        string `json:"subPath"`        // 夸克分享内的子目录路径（留空 = 分享根目录）
 	TargetServerID int64  `json:"targetServerId"` // 目标服务器
 	TargetDir      string `json:"targetDir"`      // 目标存储目录
 	LocalDir       string `json:"localDir"`       // 本地暂存目录，留空用默认临时目录
@@ -42,6 +44,7 @@ func (t *TransferController) Create(c *gin.Context) {
 	task, err := t.svc.Create(service.TransferRequest{
 		UserID:         middleware.CurrentUserID(c),
 		SourceURL:      req.SourceURL,
+		SubPath:        req.SubPath,
 		TargetServerID: req.TargetServerID,
 		TargetDir:      req.TargetDir,
 		LocalDir:       req.LocalDir,
@@ -52,6 +55,27 @@ func (t *TransferController) Create(c *gin.Context) {
 		return
 	}
 	rsp.OK(c, task)
+}
+
+type quarkShareDirsReq struct {
+	SourceURL string `json:"sourceUrl"` // 夸克分享链接（可带提取码）
+	PdirFid   string `json:"pdirFid"`   // 父目录 fid，"0" 表示分享根目录
+}
+
+// QuarkShareDirs POST /api/transfer-tasks/quark/share-dirs
+// 浏览夸克分享中的子目录，供新建任务时交互选择
+func (t *TransferController) QuarkShareDirs(c *gin.Context) {
+	var req quarkShareDirsReq
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.SourceURL) == "" {
+		rsp.Fail(c, "参数错误")
+		return
+	}
+	view, err := t.svc.ListQuarkShareDirs(middleware.CurrentUserID(c), req.SourceURL, req.PdirFid)
+	if err != nil {
+		rsp.Fail(c, err.Error())
+		return
+	}
+	rsp.OK(c, view)
 }
 
 // RecentDirs GET /api/transfer-recent-dirs?serverId=1

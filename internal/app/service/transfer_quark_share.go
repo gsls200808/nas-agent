@@ -16,7 +16,6 @@ import (
 
 	"nas-agent/internal/app/common/util"
 	"nas-agent/internal/app/model"
-	"nas-agent/internal/app/protocol/spec"
 	"nas-agent/internal/pkg/quark"
 )
 
@@ -212,7 +211,6 @@ func (s *TransferService) transferQuarkShare(ctx context.Context, cur *model.Tra
 	if err != nil {
 		return err
 	}
-
 	// 续跑：复用已记录的集数清单（已完成的集跳过）；从头开始则重新列举
 	var eps []quarkEpisode
 	if cur.ResumeStep != "" && cur.Episodes != "" {
@@ -255,10 +253,11 @@ func (s *TransferService) transferQuarkShare(ctx context.Context, cur *model.Tra
 	if err != nil {
 		return fmt.Errorf("连接目标服务器失败: %v", err)
 	}
-	defer dstCli.Close()
 	if err := ensureRemoteDir(dstCli, cur.TargetDir); err != nil {
+		dstCli.Close()
 		return err
 	}
+	dstCli.Close() // 仅提前校验可达性；每集上传时新建连接，避免长下载期间连接被对端断开
 
 	var failed []string
 	for i := range eps {
@@ -281,7 +280,7 @@ func (s *TransferService) transferQuarkShare(ctx context.Context, cur *model.Tra
 			continue
 		}
 
-		if err := s.transferOneEpisode(ctx, cli, dstCli, cur, id, pwdID, stoken, i, &eps[i]); err != nil {
+		if err := s.transferOneEpisode(ctx, cli, cur, id, pwdID, passcode, &stoken, i, &eps[i]); err != nil {
 			if ctx.Err() != nil || errors.Is(err, errTaskPaused) {
 				s.saveEpisodes(id, eps)
 				return errTaskPaused
@@ -307,11 +306,37 @@ func (s *TransferService) transferQuarkShare(ctx context.Context, cur *model.Tra
 	return nil
 }
 
-// transferOneEpisode 单集流程：转存到网盘 → 取下载地址 → 下载到本地 → 上传目标服务器 → 删除网盘副本
-func (s *TransferService) transferOneEpisode(ctx context.Context, cli *quark.Client, dstCli spec.Client,
-	task *model.TransferTask, id, pwdID, stoken string, idx int, ep *quarkEpisode) error {
-	// 1. 转存到自己的网盘根目录
-	fids, err := cli.SaveShareFile(pwdID, stoken, []string{ep.Fid}, []string{ep.Token})
+// transferOneEpisode 单集流程：转存到网盘 → 取下载地址 → 下载到本地 → 上传目标服务器 → 删除网盘副本。
+// stoken 过期（41016）时自动刷新重试一次；本地已有完整暂存文件时跳过转存与下载直接上传。
+func (s *TransferService) transferOneEpisode(ctx context.Context, cli *quark.Client,
+	task *model.TransferTask, id, pwdID, passcode string, stoken *string, idx int, ep *quarkEpisode) error {
+
+	localPath := filepath.Join(task.LocalDir, fmt.Sprintf("%s_ep_%d_%s", task.ID, idx+1, sanitizeFileName(ep.Name)))
+	targetPath := path.Join(task.TargetDir, ep.Name)
+
+	// 0. 本地暂存文件已完整（上次下载完成但上传失败的遗留），直接进入上传，不再下载
+	if fi, e := os.Stat(localPath); e == nil && ep.Size > 0 && fi.Size() == ep.Size {
+		util.Logger.Infof("夸克分享任务 %s 第 %d 集 %s 本地暂存文件已完整（%s），跳过下载直接上传", id, idx+1, ep.Name, formatBytes(fi.Size()))
+		s.mutate(id, func(t *model.TransferTask) {
+			t.Phase = PhaseTransferring
+			t.FileName = ep.Name
+			t.LocalPath = localPath
+			t.TargetPath = targetPath
+		})
+		return s.uploadEpisode(ctx, task, localPath, targetPath, ep.Size, id)
+	}
+
+	// 1. 转存到自己的网盘根目录（stoken 过期时刷新重试一次）
+	fids, err := cli.SaveShareFile(pwdID, *stoken, []string{ep.Fid}, []string{ep.Token})
+	if err != nil && isStokenExpired(err) {
+		if ns, e := cli.GetShareStoken(pwdID, passcode); e == nil {
+			util.Logger.Infof("夸克分享任务 %s 分享凭证已过期，刷新后重试转存（%s）", id, ep.Name)
+			*stoken = ns
+			fids, err = cli.SaveShareFile(pwdID, ns, []string{ep.Fid}, []string{ep.Token})
+		} else {
+			err = fmt.Errorf("刷新分享凭证失败: %v（原错误: %v）", e, err)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -332,8 +357,6 @@ func (s *TransferService) transferOneEpisode(ctx context.Context, cli *quark.Cli
 	}
 
 	// 3. 下载到本地暂存目录（每集一个临时文件，完成后立即删除）
-	localPath := filepath.Join(task.LocalDir, fmt.Sprintf("%s_ep_%d_%s", task.ID, idx+1, sanitizeFileName(ep.Name)))
-	targetPath := path.Join(task.TargetDir, ep.Name)
 	s.mutate(id, func(t *model.TransferTask) {
 		t.Phase = PhaseDownloading
 		t.FileName = ep.Name
@@ -345,9 +368,22 @@ func (s *TransferService) transferOneEpisode(ctx context.Context, cli *quark.Cli
 		return err
 	}
 
-	// 4. 上传到目标服务器
+	// 4. 上传到目标服务器（每集新建连接，下载耗时长、旧连接可能已被对端断开）
 	s.mutate(id, func(t *model.TransferTask) { t.Phase = PhaseTransferring })
-	if err := s.uploadLocal(ctx, dstCli, localPath, targetPath, ep.Size, id); err != nil {
+	return s.uploadEpisode(ctx, task, localPath, targetPath, ep.Size, id)
+}
+
+// uploadEpisode 上传本地暂存文件到目标服务器并清理本地文件（size 为该集文件大小）
+func (s *TransferService) uploadEpisode(ctx context.Context, task *model.TransferTask, localPath, targetPath string, size int64, id string) error {
+	dstCli, _, err := openServerClient(task.TargetServerID)
+	if err != nil {
+		return fmt.Errorf("连接目标服务器失败: %v", err)
+	}
+	defer dstCli.Close()
+	if err := ensureRemoteDir(dstCli, task.TargetDir); err != nil {
+		return err
+	}
+	if err := s.uploadLocal(ctx, dstCli, localPath, targetPath, size, id); err != nil {
 		return err
 	}
 	if err := os.Remove(localPath); err != nil {
@@ -355,6 +391,15 @@ func (s *TransferService) transferOneEpisode(ctx context.Context, cli *quark.Cli
 	}
 	s.mutate(id, func(t *model.TransferTask) { t.LocalPath = "" })
 	return nil
+}
+
+// isStokenExpired 判断是否为分享凭证过期错误（夸克 code 41016）
+func isStokenExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "41016") || strings.Contains(msg, "stoken")
 }
 
 // downloadEpisode 下载单集到本地，写入过程支持取消并累加整体进度
